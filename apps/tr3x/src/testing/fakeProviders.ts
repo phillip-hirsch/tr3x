@@ -43,7 +43,8 @@ const MOCK_WITHOUT_CONFIG_OPTIONS = (pids: string) =>
     '  process.stdout.write(out + "\\n");',
     "});",
     'for (const name of ["SIGTERM", "SIGINT"]) process.on(name, () => mock.kill(name));',
-    'mock.on("close", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));',
+    // exitCode, not exit(): stdout drains before the process ends.
+    'mock.on("close", (code, signal) => { process.exitCode = code ?? (signal ? 1 : 0); });',
   ].join("\n");
 
 /**
