@@ -143,14 +143,14 @@ describe("nextBlockedThread", () => {
 });
 
 describe("tab labels", () => {
-  it("finds the thread, and a new thread's project, in a tab's block label", () => {
-    expect(parseTabBlockLabel(tabBlockLabel("1b2c-3d"))).toEqual({
-      threadId: "1b2c-3d",
-      projectId: undefined,
-    });
+  it("finds the thread and its project in a tab's block label", () => {
     expect(parseTabBlockLabel(tabBlockLabel("1b2c-3d", "p-9"))).toEqual({
       threadId: "1b2c-3d",
       projectId: "p-9",
+    });
+    expect(parseTabBlockLabel("tr3x:1b2c-3d")).toEqual({
+      threadId: "1b2c-3d",
+      projectId: undefined,
     });
     expect(parseTabBlockLabel("shell")).toBeUndefined();
     expect(parseTabBlockLabel("tr3x:")).toBeUndefined();

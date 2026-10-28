@@ -24,15 +24,14 @@ const MAX_LABEL = 128;
 
 /**
  * The label that marks a block as a thread's tab, so a restarted daemon finds
- * it again. A new thread's tab also names its project: until the first message
- * launches the thread, nothing else ties the tab to it.
+ * it again. It names the project too: the shell can leave the thread out (an
+ * older settled one, or a new one before its first message).
  */
-export function tabBlockLabel(threadId: string, newThreadProjectId?: string): string {
-  const project = newThreadProjectId === undefined ? "" : `@${newThreadProjectId}`;
-  return `${BLOCK_LABEL_PREFIX}${threadId}${project}`;
+export function tabBlockLabel(threadId: string, projectId: string): string {
+  return `${BLOCK_LABEL_PREFIX}${threadId}@${projectId}`;
 }
 
-/** The thread a block shows, and a new thread's project, when its label marks it as a tab. */
+/** The thread and project a block shows, when its label marks it as a tab. */
 export function parseTabBlockLabel(
   label: string,
 ): { readonly threadId: string; readonly projectId: string | undefined } | undefined {

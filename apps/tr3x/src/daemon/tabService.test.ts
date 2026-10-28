@@ -23,6 +23,7 @@ import { startScratchRex } from "../testing/rexFixture.ts";
 import { createViewConnection } from "../view/connection.ts";
 import { controlRequest } from "./control.ts";
 import { readDaemonState } from "./daemonState.ts";
+import { parseTabBlockLabel } from "./tabs.ts";
 import { issueLocalSession, listLocalSessions } from "./localSession.ts";
 
 // Runs whatever happens to the test, last step first: daemons, then Rex (which
@@ -56,7 +57,12 @@ async function setUp() {
     expect(code, run.output()).toBe(0);
     return run.output();
   };
-  const tabs = () => rex.labelledBlocks().filter((block) => block.label.startsWith("tr3x:"));
+  /** The tr3x tabs in the scratch Rex, with the thread and project their labels name. */
+  const tabs = () =>
+    rex.labelledBlocks().flatMap((block) => {
+      const parsed = parseTabBlockLabel(block.label);
+      return parsed === undefined ? [] : [{ ...block, ...parsed }];
+    });
   const tabSessions = async (threadId: string) =>
     (await listLocalSessions(home, NODE_ENV)).filter(
       (session) => session.subject === `tr3x-tab:${threadId}`,
@@ -112,8 +118,8 @@ describe("tr3x daemon tabs", () => {
     const [tab] = tabs();
     expect(tabs()).toEqual([
       expect.objectContaining({
-        // A new thread's tab names its project until the thread exists.
-        label: expect.stringMatching(new RegExp(`^tr3x:${threadId}@[\\w-]+$`, "u")),
+        threadId,
+        projectId: expect.any(String),
         sessionId: opened.sessionId,
         sessionLabel: "work",
         windowId: opened.windowId,
@@ -163,9 +169,7 @@ describe("tr3x daemon tabs", () => {
       mark,
     );
     const [reopened] = tabs();
-    expect(reopened).toEqual(
-      expect.objectContaining({ label: `tr3x:${threadId}`, windowLabel: "Say hello" }),
-    );
+    expect(reopened).toEqual(expect.objectContaining({ threadId, windowLabel: "Say hello" }));
     expect(reopened!.blockId).not.toBe(tab!.blockId);
 
     // A daemon killed outright, then started again, finds the tab instead of opening another.
@@ -238,9 +242,7 @@ describe("tr3x daemon tabs", () => {
     ).toEqual({ ok: true });
 
     await waitForLine(owner.daemon, new RegExp(`handed thread ${threadId}'s tab its session`, "u"));
-    expect(tabs()).toEqual([
-      expect.objectContaining({ label: `tr3x:${threadId}`, sessionLabel: "work" }),
-    ]);
+    expect(tabs()).toEqual([expect.objectContaining({ threadId, sessionLabel: "work" })]);
     const next = JSON.parse(await tr3x("next-blocked")) as { threadId: string; sessionId: string };
     expect(next.threadId).toBe(threadId);
     expect(tabs()).toHaveLength(1);
@@ -259,7 +261,7 @@ describe("tr3x daemon tabs", () => {
       new RegExp(`revoked 1 session\\(s\\) for thread ${threadId}`, "u"),
       mark,
     );
-    expect(tabs().map((tab) => tab.label)).not.toContain(`tr3x:${threadId}`);
+    expect(tabs().map((tab) => tab.threadId)).not.toContain(threadId);
 
     // Open Thread lists it as archived; opening it unarchives it into a new tab.
     expect(await tr3x("pick")).toContain(`${threadId}\tRun the tool\twork\tarchived\n`);
@@ -272,16 +274,18 @@ describe("tr3x daemon tabs", () => {
       new RegExp(`handed thread ${threadId}'s tab its session`, "u"),
       mark,
     );
-    expect(tabs().map((tab) => tab.label)).toContain(`tr3x:${threadId}`);
+    expect(tabs().map((tab) => tab.threadId)).toContain(threadId);
   });
 
   it("lists the older threads the shell leaves out, and keeps each project's session after a restart", async () => {
-    const { dir, work, daemon, tr3x, apiConnection } = await setUp();
+    const { dir, work, daemon, tr3x, tabs, apiConnection } = await setUp();
     const first = daemon();
     await waitForLine(first.daemon, /found 0 thread tab\(s\) in Rex/u);
 
-    // A new thread's tab before its first message: nothing ties it to its project after a restart.
-    const draft = JSON.parse(await tr3x("new", "--cwd", work)) as {
+    // Project B: a new thread's tab, before the first message that would create the thread.
+    const otherWork = NodePath.join(dir, "elsewhere", "work");
+    NodeFS.mkdirSync(otherWork, { recursive: true });
+    const draft = JSON.parse(await tr3x("new", "--cwd", otherWork)) as {
       threadId: string;
       sessionId: string;
     };
@@ -290,19 +294,19 @@ describe("tr3x daemon tabs", () => {
       new RegExp(`handed thread ${draft.threadId}'s tab its session`, "u"),
     );
 
-    // More settled threads than the shell keeps (25).
+    // Project A, also titled "work": more settled threads than the shell keeps (25).
     const connection = await apiConnection();
-    const root = NodeFS.realpathSync(work);
-    const project = (await connection.shellSnapshot(AbortSignal.timeout(20_000))).projects.find(
-      (candidate) => candidate.workspaceRoot === root,
-    )!;
+    const projectId = ProjectId.make(NodeCrypto.randomUUID());
+    expect(
+      await connection.createProject({ projectId, title: "work", workspaceRoot: work }),
+    ).toEqual({ ok: true });
     const settled: string[] = [];
     for (let index = 0; index < 27; index += 1) {
       const threadId = ThreadId.make(NodeCrypto.randomUUID());
       expect(
         await connection.createThread({
           threadId,
-          projectId: project.id,
+          projectId,
           title: `Settled ${index}`,
           modelSelection: { instanceId: ProviderInstanceId.make("grok"), model: "grok-4.6" },
           runtimeMode: "full-access",
@@ -314,26 +318,28 @@ describe("tr3x daemon tabs", () => {
       expect(await connection.settleThread({ threadId })).toEqual({ ok: true });
       settled.push(threadId);
     }
+    // The oldest one, which a fresh shell leaves out, has a tab.
+    const oldest = settled[0]!;
+    const opened = JSON.parse(await tr3x("open", oldest)) as { sessionId: string };
+    await waitForLine(first.daemon, new RegExp(`handed thread ${oldest}'s tab its session`, "u"));
+    expect(opened.sessionId).not.toBe(draft.sessionId);
 
     first.daemon.child.kill("SIGKILL");
     await first.stop();
     const second = daemon();
-    await waitForLine(second.daemon, /found 1 thread tab\(s\) in Rex/u);
+    await waitForLine(second.daemon, /found 2 thread tab\(s\) in Rex/u);
 
-    // A fresh shell leaves some of them out; Open Thread still lists them all.
+    // A fresh shell leaves some threads out, that tab's among them; Open Thread still lists them all.
     const fresh = await (await apiConnection()).shellSnapshot(AbortSignal.timeout(20_000));
-    const omitted = fresh.olderSettled?.counts.reduce((sum, count) => sum + count.count, 0) ?? 0;
-    expect(omitted).toBeGreaterThan(0);
+    expect(fresh.threads.map((thread) => thread.id as string)).not.toContain(oldest);
     const listing = await tr3x("pick");
     for (const threadId of settled) expect(listing).toContain(threadId);
 
-    // The draft's session is still its project's, not one for another project titled "work".
-    const otherWork = NodePath.join(dir, "elsewhere", "work");
-    NodeFS.mkdirSync(otherWork, { recursive: true });
-    const other = JSON.parse(await tr3x("new", "--cwd", otherWork)) as { sessionId: string };
-    expect(other.sessionId).not.toBe(draft.sessionId);
-    // And the draft's own project still opens new threads there.
-    const same = JSON.parse(await tr3x("new", "--cwd", work)) as { sessionId: string };
-    expect(same.sessionId).toBe(draft.sessionId);
+    // Each project's new threads still go to its own session, whatever the title.
+    const inA = JSON.parse(await tr3x("new", "--cwd", work)) as { sessionId: string };
+    expect(inA.sessionId).toBe(opened.sessionId);
+    const inB = JSON.parse(await tr3x("new", "--cwd", otherWork)) as { sessionId: string };
+    expect(inB.sessionId).toBe(draft.sessionId);
+    expect(new Set(tabs().map((tab) => tab.sessionLabel))).toEqual(new Set(["work"]));
   });
 });

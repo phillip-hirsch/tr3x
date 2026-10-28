@@ -261,7 +261,7 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     const sessionLabel = rexLabel(input.projectTitle, "tr3x");
     const window = {
       windowLabel: label,
-      blockLabel: tabBlockLabel(input.threadId, input.newThread ? input.projectId : undefined),
+      blockLabel: tabBlockLabel(input.threadId, input.projectId),
       command,
     };
     const sessionId = await sessionForProject(input.projectId, sessionLabel);
@@ -371,13 +371,13 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
   const rebuild = async () => {
     const sessions = await rex!.listSessions();
     const found = new Map<string, Tab>();
-    const newThreadProjects = new Map<string, string>();
+    const labelledProjects = new Map<string, string>();
     for (const session of sessions) {
       for (const block of await rex!.listBlocks(session.sessionId)) {
         const parsed = parseTabBlockLabel(block.label);
         if (parsed === undefined || found.has(parsed.threadId)) continue;
         const { threadId } = parsed;
-        if (parsed.projectId !== undefined) newThreadProjects.set(threadId, parsed.projectId);
+        if (parsed.projectId !== undefined) labelledProjects.set(threadId, parsed.projectId);
         // Keep a known tab's own object: a hand-off in flight checks it's still the same tab.
         const previous = tabs.get(threadId);
         found.set(
@@ -409,8 +409,8 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     }
     const threads = Option.getOrNull(shellState().snapshot)?.threads ?? [];
     const projectOf = new Map([
-      ...newThreadProjects,
       ...threads.map((thread) => [thread.id as string, thread.projectId as string] as const),
+      ...labelledProjects,
     ]);
     for (const tab of tabs.values()) {
       const projectId = projectOf.get(tab.threadId);
