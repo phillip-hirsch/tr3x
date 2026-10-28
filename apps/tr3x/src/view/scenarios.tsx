@@ -1319,26 +1319,6 @@ const scenarios: Record<string, Scenario> = {
     expect(frame.includes("4 more"), "the hidden models are counted", frame);
     await ui.dispose();
   },
-
-  async "a provider that needs a new thread for a model change refuses one once started"() {
-    const locked = provider("claudeAgent", {
-      displayName: "Claude",
-      requiresNewThreadForModelChange: true,
-      models: [model("opus", "Opus"), model("sonnet", "Sonnet")],
-    });
-    const current = { instanceId: locked.instanceId, model: "opus" };
-    const view = createFakeView([locked]);
-    view.setProjection(
-      projection({ selection: current, runs: [run("r1", 1, "completed", current)] }),
-    );
-    const ui = await mount(view);
-    await ui.press("p", { ctrl: true });
-    await ui.arrow("down");
-    const frame = await ui.enter();
-    expect(view.commands.updateThread.calls.length === 0, "no model change is sent");
-    expect(frame.includes("Start a new thread to change models"), "the view says why", frame);
-    await ui.dispose();
-  },
 };
 
 const [name] = process.argv.slice(2);

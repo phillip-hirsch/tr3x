@@ -71,10 +71,6 @@ describe("modelChangeBlockReason", () => {
   const codexId = ProviderInstanceId.make("codex");
   const claudeId = ProviderInstanceId.make("claudeAgent");
   const base = {
-    providers: [
-      { instanceId: codexId, requiresNewThreadForModelChange: true },
-      { instanceId: claudeId },
-    ],
     hasStartedSession: true,
     supportsHandoff: true,
     current: { instanceId: codexId, model: "gpt-5" },
@@ -87,10 +83,9 @@ describe("modelChangeBlockReason", () => {
     expect(modelChangeBlockReason({ ...base, next: base.current })).toBeNull();
   });
 
-  it("refuses a model change on a provider that needs a new thread for one", () => {
-    expect(
-      modelChangeBlockReason({ ...base, next: { instanceId: codexId, model: "gpt-6" } }),
-    ).toMatch(/^Start a new thread to change models/u);
+  it("allows a model change on the same provider, even without handoff support", () => {
+    const next = { instanceId: codexId, model: "gpt-6" };
+    expect(modelChangeBlockReason({ ...base, supportsHandoff: false, next })).toBeNull();
   });
 
   it("allows a provider switch only with handoff support", () => {

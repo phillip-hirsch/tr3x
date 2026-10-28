@@ -52,29 +52,17 @@ export function endpointLabel(
  * `getStartedThreadModelChangeBlockReason` (apps/web/src/components/ChatView.logic.ts).
  */
 export function modelChangeBlockReason(input: {
-  readonly providers: ReadonlyArray<
-    Pick<ServerProvider, "instanceId" | "requiresNewThreadForModelChange">
-  >;
   readonly hasStartedSession: boolean;
   readonly supportsHandoff: boolean;
   readonly current: ModelSelection;
   readonly currentProviderInstanceId: ProviderInstanceId | null;
   readonly next: ModelSelection;
 }): string | null {
-  if (!input.hasStartedSession) return null;
+  if (!input.hasStartedSession || input.supportsHandoff) return null;
   const currentInstance = input.currentProviderInstanceId ?? input.current.instanceId;
-  if (currentInstance === input.next.instanceId && input.current.model === input.next.model) {
-    return null;
-  }
-  if (currentInstance !== input.next.instanceId) {
-    return input.supportsHandoff ? null : "Start a new thread to switch providers.";
-  }
-  const requiresNewThread = (instanceId: ProviderInstanceId) =>
-    input.providers.find((provider) => provider.instanceId === instanceId)
-      ?.requiresNewThreadForModelChange === true;
-  return requiresNewThread(currentInstance) || requiresNewThread(input.next.instanceId)
-    ? "Start a new thread to change models: this provider can't switch models mid-conversation."
-    : null;
+  return currentInstance === input.next.instanceId
+    ? null
+    : "Start a new thread to switch providers.";
 }
 
 /** One row of the model picker: a usable provider's model. */

@@ -5,7 +5,7 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useAtomValue } from "@effect/atom-react";
 import { deriveThreadStructureRuntime } from "@t3tools/client-runtime/state/thread-execution";
 import { threadSupportsProviderHandoff } from "@t3tools/client-runtime/state/thread-workflows";
-import type { StartThreadTurnInput } from "@t3tools/client-runtime/state/threads";
+import type { StartThreadTurnInput } from "@t3tools/client-runtime/operations";
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
@@ -441,7 +441,6 @@ export function App(props: AppProps) {
       fresh === null
         ? null
         : modelChangeBlockReason({
-            providers,
             hasStartedSession: runtime !== null,
             supportsHandoff: threadSupportsProviderHandoff(fresh),
             current: fresh.thread.modelSelection,
