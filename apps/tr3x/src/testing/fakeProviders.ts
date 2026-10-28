@@ -3,7 +3,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
-import { execScriptSource, writeFakeCli } from "@t3tools/provider-testing/fakeCli";
+import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 
 const MOCK_AGENT = NodeURL.fileURLToPath(
   new URL("../../../server/scripts/acp-mock-agent.ts", import.meta.url),
@@ -26,8 +26,29 @@ function pidDir(home: string): string {
 }
 
 /**
+ * Upstream's mock ACP agent minus its config options: they list no Grok slugs, so
+ * the server would refuse every Grok model. The mock gets `pids` as an argument
+ * so its command line names the home.
+ */
+const MOCK_WITHOUT_CONFIG_OPTIONS = (pids: string) =>
+  [
+    'import { spawn } from "node:child_process";',
+    'import { createInterface } from "node:readline";',
+    `const mock = spawn(process.execPath, [${JSON.stringify(MOCK_AGENT)}, ${JSON.stringify(pids)}], { stdio: ["inherit", "pipe", "inherit"] });`,
+    `writePid(${JSON.stringify(pids)} + "/" + mock.pid, "");`,
+    'const strip = (_key, value) => (_key === "configOptions" ? [] : value);',
+    'createInterface({ input: mock.stdout }).on("line", (line) => {',
+    "  let out = line;",
+    "  try { out = JSON.stringify(JSON.parse(line, strip)); } catch {}",
+    '  process.stdout.write(out + "\\n");',
+    "});",
+    'for (const name of ["SIGTERM", "SIGINT"]) process.on(name, () => mock.kill(name));',
+    'mock.on("close", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));',
+  ].join("\n");
+
+/**
  * A stand-in Grok CLI: canned `--version` and `models`, and upstream's mock ACP
- * agent for `agent`, which records its pid in `pids`.
+ * agent for `agent`. Each process records its pid in `pids`.
  */
 function writeFakeGrok(
   directory: string,
@@ -46,7 +67,7 @@ function writeFakeGrok(
       'if (!process.argv.includes("agent")) process.exit(1);',
       `makePidDir(${JSON.stringify(pids)}, { recursive: true });`,
       `writePid(${JSON.stringify(pids)} + "/" + process.pid, "");`,
-      execScriptSource({ scriptPath: MOCK_AGENT }),
+      MOCK_WITHOUT_CONFIG_OPTIONS(pids),
     ].join("\n"),
   });
 }
@@ -88,13 +109,10 @@ export interface FakeProviders {
 export function installFakeProviders(home: string, firstReply: string): FakeProviders {
   const bin = NodePath.join(home, "fake-bin");
   const secondRequestLog = NodePath.join(bin, "grok-b-requests.ndjson");
-  // The mock's model option doesn't list Grok's slugs; without it the adapter keeps the default.
   const first = writeFakeGrok(NodePath.join(bin, "a"), pidDir(home), {
     T3_ACP_PROMPT_RESPONSE_TEXT: firstReply,
-    T3_ACP_OMIT_MODEL_CONFIG_OPTION: "1",
   });
   const second = writeFakeGrok(NodePath.join(bin, "b"), pidDir(home), {
-    T3_ACP_OMIT_MODEL_CONFIG_OPTION: "1",
     T3_ACP_EMIT_TOOL_CALLS: "1",
     T3_ACP_REQUEST_LOG_PATH: secondRequestLog,
   });
