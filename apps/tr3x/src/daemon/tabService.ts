@@ -7,7 +7,9 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentId,
+  type OrchestrationProjectShell as ProjectShell,
   type OrchestrationV2ShellSnapshot,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 
@@ -58,6 +60,8 @@ interface Tab {
   readonly blockId: string;
   label: string;
   lastSeen: ThreadShell | undefined;
+  /** Set the moment Rex reports the tab closed, before the queue gets to it. */
+  closed: boolean;
 }
 
 /** Where `open`, `new` and `next-blocked` put the thread, so the Rex glue can show that session. */
@@ -73,6 +77,7 @@ export interface ThreadEntry {
   readonly project: string;
   readonly open: boolean;
   readonly blocked: boolean;
+  readonly archived: boolean;
 }
 
 export interface TabService {
@@ -137,9 +142,11 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
   };
 
   const forget = (tab: Tab) => {
+    tab.closed = true;
     tabs.delete(tab.threadId);
     threadOfBlock.delete(tab.blockId);
   };
+  const isLive = (tab: Tab) => !tab.closed && tabs.get(tab.threadId) === tab;
 
   /** Revokes every session minted for the thread's tabs up to `before`, when its tab closed. */
   const revokeTabSessions = async (threadId: string, before: number) => {
@@ -151,10 +158,16 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     for (const session of stale) await revokeLocalSession(paths.home, session.sessionId, env);
     log(`revoked ${stale.length} session(s) for thread ${threadId}`);
   };
-  const revokeLater = (threadId: string, before: number) =>
-    void revokeTabSessions(threadId, before).catch((error: unknown) =>
-      log(`could not revoke thread ${threadId}'s sessions: ${describeError(error)}`),
-    );
+  /** Threads whose sessions are being revoked, which the leftover sweep leaves alone. */
+  const revoking = new Set<string>();
+  const revokeLater = (threadId: string, before: number) => {
+    revoking.add(threadId);
+    void revokeTabSessions(threadId, before)
+      .catch((error: unknown) =>
+        log(`could not revoke thread ${threadId}'s sessions: ${describeError(error)}`),
+      )
+      .finally(() => revoking.delete(threadId));
+  };
 
   const mintTabSession = (threadId: string): Promise<IssuedSession> =>
     issueLocalSession({
@@ -177,13 +190,13 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     } catch (error) {
       log(`could not start a session for thread ${tab.threadId}: ${describeError(error)}`);
       await serial(async () => {
-        if (tabs.get(tab.threadId) !== tab) return;
+        if (!isLive(tab)) return;
         forget(tab);
         await rex?.closeWindow(tab.sessionId, tab.windowId).catch(() => {});
       });
       return;
     }
-    if (tabs.get(tab.threadId) !== tab) {
+    if (!isLive(tab)) {
       await revokeLocalSession(paths.home, session.sessionId, env).catch(() => {});
       return;
     }
@@ -203,12 +216,17 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     }, LAUNCH_FILE_TTL_MS).unref();
   };
 
-  /** The project's session: the one tr3x used for it, else one labelled with its title. */
+  /**
+   * The project's session: the one tr3x used for it, else one labelled with its
+   * title that no other project uses, since two projects can share a title.
+   */
   const sessionForProject = async (projectId: string, label: string) => {
     const known = projectSessions.get(projectId);
     if (known !== undefined) return known;
+    const taken = new Set(projectSessions.values());
     const sessions = await rex!.listSessions();
-    return sessions.find((session) => session.label === label)?.sessionId;
+    return sessions.find((session) => session.label === label && !taken.has(session.sessionId))
+      ?.sessionId;
   };
 
   const openTab = async (input: {
@@ -253,7 +271,13 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
               return await rex.createSession({ label: sessionLabel, ...window });
             });
     projectSessions.set(input.projectId, placement.sessionId);
-    const tab: Tab = { threadId: input.threadId, ...placement, label, lastSeen: undefined };
+    const tab: Tab = {
+      threadId: input.threadId,
+      ...placement,
+      label,
+      lastSeen: undefined,
+      closed: false,
+    };
     tabs.set(tab.threadId, tab);
     threadOfBlock.set(tab.blockId, tab.threadId);
     log(`opened thread ${tab.threadId} in session ${tab.sessionId}`);
@@ -262,11 +286,11 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
   };
 
   const openThread = (
-    snapshot: OrchestrationV2ShellSnapshot,
+    projects: ReadonlyArray<ProjectShell>,
     thread: ThreadShell,
     focus: boolean,
   ) => {
-    const project = snapshot.projects.find((candidate) => candidate.id === thread.projectId);
+    const project = projects.find((candidate) => candidate.id === thread.projectId);
     return openTab({
       threadId: thread.id,
       title: thread.title,
@@ -317,7 +341,7 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     for (const threadId of plan.openBlocked) {
       const thread = snapshot.threads.find((candidate) => candidate.id === threadId);
       if (thread !== undefined) {
-        await openThread(snapshot, thread, false).catch((error: unknown) =>
+        await openThread(snapshot.projects, thread, false).catch((error: unknown) =>
           log(`could not open blocked thread ${threadId}: ${describeError(error)}`),
         );
       }
@@ -358,6 +382,7 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
                 blockId: block.blockId,
                 label: "",
                 lastSeen: undefined,
+                closed: false,
               },
         );
       }
@@ -382,9 +407,75 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     }
     mapped = true;
     log(`found ${tabs.size} thread tab(s) in Rex`);
+    await closeArchivedWhileAway(threads);
     if (firstMap) void revokeLeftovers(Date.now());
     await reconcile();
   };
+
+  /**
+   * Tabs whose thread the shell doesn't list may have been archived while no
+   * daemon watched; the shell has no record of that, so ask the archive.
+   */
+  const closeArchivedWhileAway = async (threads: ReadonlyArray<ThreadShell>) => {
+    const listed = new Set(threads.map((thread) => thread.id as string));
+    const unknown = [...tabs.values()].filter((tab) => !listed.has(tab.threadId));
+    if (unknown.length === 0) return;
+    const archived = await connection.archivedShell().then(
+      (shell) => new Set(shell.threads.map((thread) => thread.id as string)),
+      (error: unknown) => {
+        log(`could not read the archive: ${describeError(error)}`);
+        return new Set<string>();
+      },
+    );
+    for (const tab of unknown) {
+      if (archived.has(tab.threadId)) await closeTab(tab, "the thread was archived");
+    }
+  };
+
+  /** A thread wherever the server keeps it: the shell, the archive, or its family for one the shell left out. */
+  const findThread = async (threadId: string) => {
+    const snapshot = requireShell();
+    const active = snapshot.threads.find((thread) => thread.id === threadId);
+    if (active !== undefined)
+      return { thread: active, projects: snapshot.projects, archived: false };
+    const archive = await connection.archivedShell();
+    const archived = archive.threads.find((thread) => thread.id === threadId);
+    if (archived !== undefined) {
+      return {
+        thread: archived,
+        projects: [...snapshot.projects, ...archive.projects],
+        archived: true,
+      };
+    }
+    const family = await connection.threadFamily(ThreadId.make(threadId)).catch(() => undefined);
+    const member = family?.threads.find((thread) => thread.id === threadId);
+    return member === undefined
+      ? undefined
+      : { thread: member, projects: snapshot.projects, archived: false };
+  };
+
+  /** Resolves once the shell lists the thread as active, e.g. after unarchiving it. */
+  const untilActive = (threadId: string) =>
+    new Promise<void>((resolve, reject) => {
+      const listed = () =>
+        Option.getOrNull(shellState().snapshot)?.threads.some(
+          (thread) => thread.id === threadId,
+        ) === true;
+      if (listed()) return resolve();
+      const timer = setTimeout(() => {
+        stop();
+        reject(new Error("The unarchived thread didn't come back; try again."));
+      }, 15_000);
+      const unsubscribe = connection.registry.subscribe(connection.shellStateAtom, () => {
+        if (!listed()) return;
+        stop();
+        resolve();
+      });
+      const stop = () => {
+        clearTimeout(timer);
+        unsubscribe();
+      };
+    });
 
   /**
    * Sessions earlier daemons left: their own, and those of tabs closed while
@@ -398,6 +489,7 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
           (session.subject === DAEMON_SUBJECT && Date.parse(session.issuedAt) < startedAt) ||
           (session.subject.startsWith(TAB_SUBJECT_PREFIX) &&
             !tabs.has(session.subject.slice(TAB_SUBJECT_PREFIX.length)) &&
+            !revoking.has(session.subject.slice(TAB_SUBJECT_PREFIX.length)) &&
             Date.parse(session.issuedAt) <= now),
       );
       for (const session of stale) await revokeLocalSession(paths.home, session.sessionId, env);
@@ -409,16 +501,20 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
 
   const onRexEvent = (event: RexEvent) => {
     const at = Date.now();
-    void serial(async () => {
-      if (event.kind === "session_destroyed") {
+    if (event.kind === "session_destroyed") {
+      void serial(async () => {
         for (const [projectId, sessionId] of projectSessions) {
           if (sessionId === event.sessionId) projectSessions.delete(projectId);
         }
-        return;
-      }
-      const threadId = threadOfBlock.get(event.blockId);
-      const tab = threadId === undefined ? undefined : tabs.get(threadId);
-      if (tab === undefined) return;
+      });
+      return;
+    }
+    const threadId = threadOfBlock.get(event.blockId);
+    const tab = threadId === undefined ? undefined : tabs.get(threadId);
+    if (tab === undefined || tab.closed) return;
+    // At once, so a bearer minted from here on is revoked rather than handed out.
+    tab.closed = true;
+    void serial(async () => {
       forget(tab);
       const thread = Option.getOrNull(shellState().snapshot)?.threads.find(
         (candidate) => candidate.id === tab.threadId,
@@ -479,11 +575,17 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
         ).then(({ threadId, sessionId, windowId }) => ({ threadId, sessionId, windowId }));
       }
       case "open": {
-        const thread = requireShell().threads.find(
-          (candidate) => candidate.id === request.threadId,
-        );
-        if (thread === undefined) throw new Error(`No open thread ${request.threadId}.`);
-        return await serial(() => openThread(requireShell(), thread, true)).then(
+        const found = await findThread(request.threadId);
+        if (found === undefined || found.thread.deletedAt !== null) {
+          throw new Error(`No thread ${request.threadId}.`);
+        }
+        if (found.archived) {
+          // Archiving closed the tab; opening it again is the way back.
+          const result = await connection.unarchiveThread({ threadId: found.thread.id });
+          if (!result.ok) throw new Error(`Could not unarchive the thread: ${result.error}`);
+          await untilActive(found.thread.id);
+        }
+        return await serial(() => openThread(found.projects, found.thread, true)).then(
           ({ threadId, sessionId, windowId }) => ({ threadId, sessionId, windowId }),
         );
       }
@@ -491,31 +593,46 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
         const thread = nextBlockedThread(requireShell().threads, lastNextBlocked);
         if (thread === undefined) return null;
         lastNextBlocked = thread.id;
-        return await serial(() => openThread(requireShell(), thread, true)).then(
+        return await serial(() => openThread(requireShell().projects, thread, true)).then(
           ({ threadId, sessionId, windowId }) => ({ threadId, sessionId, windowId }),
         );
       }
       case "threads": {
         const snapshot = requireShell();
-        const projects = new Map(snapshot.projects.map((project) => [project.id, project.title]));
-        return snapshot.threads
-          .filter(
-            (thread) =>
-              thread.lineage.relationshipToParent !== "subagent" && thread.deletedAt === null,
-          )
-          .map((thread): ThreadEntry => ({
+        const archive = await connection.archivedShell().catch((error: unknown) => {
+          log(`could not read the archive: ${describeError(error)}`);
+          return { projects: [], threads: [] };
+        });
+        const projects = new Map(
+          [...archive.projects, ...snapshot.projects].map((project) => [project.id, project.title]),
+        );
+        const entry =
+          (archived: boolean) =>
+          (thread: ThreadShell): ThreadEntry => ({
             threadId: thread.id,
             title: thread.title,
             project: projects.get(thread.projectId) ?? "",
             open: tabs.has(thread.id),
-            blocked: blockingRequestId(thread) !== undefined,
-          }));
+            blocked: !archived && blockingRequestId(thread) !== undefined,
+            archived,
+          });
+        const topLevel = (thread: ThreadShell) =>
+          thread.lineage.relationshipToParent !== "subagent" && thread.deletedAt === null;
+        return [
+          ...snapshot.threads.filter(topLevel).map(entry(false)),
+          ...archive.threads.filter(topLevel).map(entry(true)),
+        ];
       }
       case "bearer": {
-        if (threadIdOfBlockLabel(tabBlockLabel(request.threadId)) === undefined) {
-          throw new Error("That isn't a thread id.");
+        // Only a live tab gets one, and a tab that closes while it's minted gets none.
+        const tab = tabs.get(request.threadId);
+        if (tab === undefined || tab.closed) throw new Error("That thread has no tab.");
+        const session = await mintTabSession(tab.threadId);
+        if (!isLive(tab)) {
+          await revokeLocalSession(paths.home, session.sessionId, env).catch(() => {});
+          throw new Error("That thread's tab closed.");
         }
-        return await mintTabSession(request.threadId);
+        return session;
       }
     }
   };

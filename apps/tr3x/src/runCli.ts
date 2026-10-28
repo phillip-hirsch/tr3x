@@ -59,7 +59,7 @@ export async function runCli(argv: ReadonlyArray<string>, io: CliIo): Promise<nu
   }
   if (command.kind === "pick") {
     const { runPick } = await import("./pick.ts");
-    return await runPick(paths);
+    return await runPick(paths, io.env, command.clientId);
   }
   if (command.kind === "launch" && !io.env.TR3X_LAUNCH) {
     io.err(`tr3x: view needs a thread id\n\n${USAGE}`);

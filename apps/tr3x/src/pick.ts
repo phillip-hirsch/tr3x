@@ -4,6 +4,7 @@ import * as NodeReadline from "node:readline";
 import { controlRequest } from "./daemon/control.ts";
 import type { ThreadEntry } from "./daemon/tabService.ts";
 import type { Tr3xPaths } from "./paths.ts";
+import { makeRexClient } from "./rex/rex.ts";
 import { describeError } from "./redact.ts";
 
 /** Threads whose title or project holds every word of `query`, waiting ones first. */
@@ -20,7 +21,7 @@ export function filterThreads(
     .toSorted((a, b) => Number(b.blocked) - Number(a.blocked));
 }
 
-/** One line per thread: a marker for waiting (!) or open (•), the title, the project. */
+/** One line per thread: a marker for waiting (!), open (•) or archived (a), the title, the project. */
 export function pickLines(
   threads: ReadonlyArray<ThreadEntry>,
   selected: number,
@@ -28,7 +29,7 @@ export function pickLines(
 ): ReadonlyArray<string> {
   const start = Math.max(0, Math.min(selected - rows + 1, threads.length - rows));
   return threads.slice(start, start + rows).map((thread, offset) => {
-    const marker = thread.blocked ? "!" : thread.open ? "•" : " ";
+    const marker = thread.archived ? "a" : thread.blocked ? "!" : thread.open ? "•" : " ";
     const cursor = start + offset === selected ? ">" : " ";
     return `${cursor} ${marker} ${thread.title}  (${thread.project})`;
   });
@@ -38,15 +39,27 @@ const decodeThreads = (value: unknown): ReadonlyArray<ThreadEntry> =>
   Array.isArray(value) ? (value as ReadonlyArray<ThreadEntry>) : [];
 
 /**
- * `tr3x pick`: a filterable list of threads. Enter opens one as a tab; Escape
- * leaves. Without a terminal, it prints the list.
+ * `tr3x pick`: a filterable list of threads, archived ones too. Enter opens one
+ * as a tab (unarchiving it); Escape leaves. Without a terminal, it prints the list.
  */
-export async function runPick(paths: Tr3xPaths): Promise<number> {
+export async function runPick(
+  paths: Tr3xPaths,
+  env: NodeJS.ProcessEnv,
+  clientId: string | undefined,
+): Promise<number> {
   const threads = decodeThreads(await controlRequest(paths.controlSocketPath, { op: "threads" }));
   const { stdin, stdout } = process;
   if (!stdin.isTTY) {
-    for (const thread of threads)
-      stdout.write(`${thread.threadId}\t${thread.title}\t${thread.project}\n`);
+    for (const thread of threads) {
+      const state = thread.archived
+        ? "archived"
+        : thread.blocked
+          ? "blocked"
+          : thread.open
+            ? "open"
+            : "";
+      stdout.write(`${thread.threadId}\t${thread.title}\t${thread.project}\t${state}\n`);
+    }
     return 0;
   }
   let query = "";
@@ -85,14 +98,28 @@ export async function runPick(paths: Tr3xPaths): Promise<number> {
         void controlRequest(paths.controlSocketPath, {
           op: "open",
           threadId: thread.threadId,
-        }).then(
-          () => finish(0),
-          (error: unknown) => {
-            opening = false;
-            message = `Could not open it: ${describeError(error)}`;
-            shown = draw();
-          },
-        );
+        })
+          .then(async (opened) => {
+            const sessionId = (opened as { readonly sessionId?: unknown } | null)?.sessionId;
+            // The tab may be in another project's session, which the app isn't showing.
+            if (
+              clientId !== undefined &&
+              typeof sessionId === "string" &&
+              sessionId !== env.REX_SESSION
+            ) {
+              await makeRexClient(env)
+                .selectSession(clientId, sessionId)
+                .catch(() => {});
+            }
+          })
+          .then(
+            () => finish(0),
+            (error: unknown) => {
+              opening = false;
+              message = `Could not open it: ${describeError(error)}`;
+              shown = draw();
+            },
+          );
         return;
       }
       if (key.name === "up" || (key.ctrl && key.name === "p")) selected -= 1;

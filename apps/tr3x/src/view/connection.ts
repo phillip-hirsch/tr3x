@@ -1,6 +1,7 @@
 import { Connection } from "@t3tools/client-runtime/connection";
 import {
   type ArchiveThreadInput,
+  type UnarchiveThreadInput,
   cancelQueuedRun,
   createProject,
   type CancelQueuedRunInput,
@@ -16,6 +17,7 @@ import {
 import { createEnvironmentCatalogAtoms } from "@t3tools/client-runtime/state/connections";
 import {
   createEnvironmentCommand,
+  createEnvironmentRpcCommand,
   runAtomCommand,
   type AtomCommand,
 } from "@t3tools/client-runtime/state/runtime";
@@ -32,7 +34,12 @@ import {
   createThreadEnvironmentAtoms,
   ThreadHistoryController,
 } from "@t3tools/client-runtime/state/threads";
-import type { EnvironmentId, OrchestrationV2ShellSnapshot, ThreadId } from "@t3tools/contracts";
+import {
+  type EnvironmentId,
+  ORCHESTRATION_V2_WS_METHODS,
+  type OrchestrationV2ShellSnapshot,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -86,6 +93,27 @@ export function createViewConnection(server: Platform.ViewServer) {
     label: "tr3x:thread:cancel-queued",
     execute: (input: CancelQueuedRunInput) => cancelQueuedRun(input),
   });
+
+  const archivedShellCommand = createEnvironmentRpcCommand(runtime, {
+    label: "tr3x:archived-shell",
+    tag: ORCHESTRATION_V2_WS_METHODS.getArchivedShellSnapshot,
+  });
+  const threadFamilyCommand = createEnvironmentRpcCommand(runtime, {
+    label: "tr3x:thread-family",
+    tag: ORCHESTRATION_V2_WS_METHODS.getThreadFamily,
+  });
+
+  /** A command's value, or its error thrown. */
+  const query = <Input, A, E>(
+    command: AtomCommand<{ environmentId: EnvironmentId; input: Input }, A, E>,
+    input: Input,
+  ): Promise<A> =>
+    runAtomCommand(registry, command, { environmentId, input }, { reportFailure: false }).then(
+      (result) => {
+        if (AsyncResult.isSuccess(result)) return result.value;
+        throw new Error(errorText(Cause.squash(result.cause)));
+      },
+    );
 
   const run = <Input, A, E>(
     command: AtomCommand<{ environmentId: EnvironmentId; input: Input }, A, E>,
@@ -155,6 +183,11 @@ export function createViewConnection(server: Platform.ViewServer) {
     cancelQueuedRun: (input: CancelQueuedRunInput) => run(cancelQueuedCommand, input),
     createProject: (input: CreateProjectInput) => run(createProjectCommand, input),
     archiveThread: (input: ArchiveThreadInput) => run(threadCommands.archive, input),
+    unarchiveThread: (input: UnarchiveThreadInput) => run(threadCommands.unarchive, input),
+    /** Every archived thread; the shell leaves them out. */
+    archivedShell: () => query(archivedShellCommand, {}),
+    /** The active threads in `threadId`'s family, including ones the shell left out as older settled. */
+    threadFamily: (threadId: ThreadId) => query(threadFamilyCommand, { threadId }),
     loadEarlier: (threadId: ThreadId) => run(threadCommands.loadEarlierHistory, { threadId }),
     dispose: () => registry.dispose(),
   };
@@ -170,6 +203,9 @@ export type ViewApi = Omit<
   | "shellSnapshot"
   | "createProject"
   | "archiveThread"
+  | "unarchiveThread"
+  | "archivedShell"
+  | "threadFamily"
   | "dispose"
 >;
 

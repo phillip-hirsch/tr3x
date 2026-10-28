@@ -73,7 +73,8 @@ rex.action({
       focus = true,
       layout = rex.layout.block({
         flavor = TERMINAL .. ".shell",
-        options = { command = argv("pick") },
+        -- The app that asked, so the picker can show it the session the thread opens in.
+        options = { command = ctx.client_id and argv("pick", "--client", ctx.client_id) or argv("pick") },
       }),
     })
     if layer == nil then error(err, 0) end

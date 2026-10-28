@@ -17,6 +17,9 @@ describe("parseArgs", () => {
     expect(parseArgs(["open", "thread-1"], "/w")).toEqual({ kind: "open", threadId: "thread-1" });
     expect(parseArgs(["next-blocked"], "/w")).toEqual({ kind: "next-blocked" });
     expect(parseArgs(["setup", "rex"], "/w")).toEqual({ kind: "setup-rex" });
+    expect(parseArgs(["pick"], "/w")).toEqual({ kind: "pick", clientId: undefined });
+    expect(parseArgs(["pick", "--client", "c1"], "/w")).toEqual({ kind: "pick", clientId: "c1" });
+    expect(parseArgs(["pick", "c1"], "/w")).toBeNull();
     expect(parseArgs(["new", "/repo"], "/w")).toBeNull();
     expect(parseArgs(["open"], "/w")).toBeNull();
     expect(parseArgs(["open", "--all"], "/w")).toBeNull();

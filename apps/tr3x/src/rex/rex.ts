@@ -222,6 +222,16 @@ export function makeRexClient(env: NodeJS.ProcessEnv) {
       call("session.focus_window", { session_id: sessionId, window_id: windowId }),
     closeWindow: (sessionId: string, windowId: string) =>
       call("session.close_window", { session_id: sessionId, window_id: windowId }),
+    /** Asks a Rex app to show a session. The app takes this from the CLI only with Remote Control on. */
+    selectSession: (clientId: string, sessionId: string) =>
+      new Promise<void>((resolve, reject) => {
+        NodeChildProcess.execFile(
+          requireCli(),
+          [...global, "-C", clientId, "do", "session.select", `session_id=${sessionId}`],
+          { timeout: 15_000 },
+          (error) => (error ? reject(error) : resolve()),
+        );
+      }),
     /**
      * Streams each `rex events --all --json` line into `onLine` until `signal` aborts or the
      * stream ends, e.g. when the Rex server stops. `started` resolves once the

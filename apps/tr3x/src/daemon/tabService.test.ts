@@ -21,6 +21,7 @@ import { startDaemon } from "../testing/daemonFixture.ts";
 import { installFakeProviders } from "../testing/fakeProviders.ts";
 import { startScratchRex } from "../testing/rexFixture.ts";
 import { createViewConnection } from "../view/connection.ts";
+import { controlRequest } from "./control.ts";
 import { readDaemonState } from "./daemonState.ts";
 import { issueLocalSession, listLocalSessions } from "./localSession.ts";
 
@@ -83,7 +84,7 @@ async function setUp() {
     await connection.shellSnapshot(AbortSignal.timeout(20_000));
     return connection;
   };
-  return { home, work, rex, daemon, tr3x, tabs, tabSessions, apiConnection };
+  return { dir, home, work, rex, daemon, tr3x, tabs, tabSessions, apiConnection };
 }
 
 /** Command lines of every process whose arguments mention `text`. */
@@ -96,7 +97,7 @@ function processesMentioning(text: string): ReadonlyArray<string> {
 describe("tr3x daemon tabs", () => {
   it("opens, relabels, hides, reopens and closes a thread's tab, across a daemon restart", async () => {
     const { home, work, rex, daemon, tr3x, tabs, tabSessions, apiConnection } = await setUp();
-    const paths = resolveTr3xPaths({ TR3X_HOME: home });
+    const paths = resolveTr3xPaths({ TR3X_HOME: home, XDG_STATE_HOME: `${home}-state` });
     const first = daemon();
     await waitForLine(first.daemon, /found 0 thread tab\(s\) in Rex/u);
 
@@ -147,6 +148,10 @@ describe("tr3x daemon tabs", () => {
     expect(first.daemon.output().slice(mark)).toContain("hiding the thread");
     expect(tabs()).toEqual([]);
     expect(await tabSessions(threadId)).toEqual([]);
+    // A closed tab's view can't get a fresh bearer either.
+    await expect(
+      controlRequest(paths.controlSocketPath, { op: "bearer", threadId }),
+    ).rejects.toThrow("That thread has no tab.");
 
     // Open brings it back in a new tab with a new session.
     mark = first.daemon.output().length;
@@ -169,24 +174,28 @@ describe("tr3x daemon tabs", () => {
     await waitForLine(second.daemon, /found 1 thread tab\(s\) in Rex/u);
     expect(tabs()).toEqual([expect.objectContaining({ blockId: reopened!.blockId })]);
 
-    // Archiving through the T3 API closes the tab and revokes its session.
+    // An archive no daemon saw (this one is suspended) still closes the tab once one starts.
     const connection = await apiConnection();
-    mark = second.daemon.output().length;
+    second.daemon.child.kill("SIGSTOP");
     expect(await connection.archiveThread({ threadId: ThreadId.make(threadId) })).toEqual({
       ok: true,
     });
+    second.daemon.child.kill("SIGKILL");
+    await second.stop();
+    const third = daemon();
     await waitForLine(
-      second.daemon,
+      third.daemon,
       new RegExp(`revoked 1 session\\(s\\) for thread ${threadId}`, "u"),
-      mark,
     );
-    expect(second.daemon.output().slice(mark)).toContain("the thread was archived or deleted");
+    expect(third.daemon.output()).toContain(
+      `closing thread ${threadId}'s tab: the thread was archived`,
+    );
     expect(tabs()).toEqual([]);
     expect(await tabSessions(threadId)).toEqual([]);
   });
 
   it("opens a background tab for a thread that blocks without one, and Next Blocked goes there", async () => {
-    const { work, daemon, tr3x, tabs, apiConnection } = await setUp();
+    const { dir, work, daemon, tr3x, tabs, apiConnection } = await setUp();
     const owner = daemon();
     await waitForLine(owner.daemon, /found 0 thread tab\(s\) in Rex/u);
     expect(JSON.parse(await tr3x("next-blocked"))).toBeNull();
@@ -231,8 +240,37 @@ describe("tr3x daemon tabs", () => {
     expect(tabs()).toEqual([
       expect.objectContaining({ label: `tr3x:${threadId}`, sessionLabel: "work" }),
     ]);
-    const next = JSON.parse(await tr3x("next-blocked")) as { threadId: string };
+    const next = JSON.parse(await tr3x("next-blocked")) as { threadId: string; sessionId: string };
     expect(next.threadId).toBe(threadId);
     expect(tabs()).toHaveLength(1);
+
+    // Another project with the same title gets a session of its own.
+    const otherWork = NodePath.join(dir, "elsewhere", "work");
+    NodeFS.mkdirSync(otherWork, { recursive: true });
+    const other = JSON.parse(await tr3x("new", "--cwd", otherWork)) as { sessionId: string };
+    expect(other.sessionId).not.toBe(next.sessionId);
+
+    // Archiving through the T3 API closes the tab and revokes its session.
+    let mark = owner.daemon.output().length;
+    expect(await connection.archiveThread({ threadId })).toEqual({ ok: true });
+    await waitForLine(
+      owner.daemon,
+      new RegExp(`revoked 1 session\\(s\\) for thread ${threadId}`, "u"),
+      mark,
+    );
+    expect(tabs().map((tab) => tab.label)).not.toContain(`tr3x:${threadId}`);
+
+    // Open Thread lists it as archived; opening it unarchives it into a new tab.
+    expect(await tr3x("pick")).toContain(`${threadId}\tRun the tool\twork\tarchived\n`);
+    mark = owner.daemon.output().length;
+    expect(JSON.parse(await tr3x("open", threadId))).toEqual(
+      expect.objectContaining({ threadId, sessionId: next.sessionId }),
+    );
+    await waitForLine(
+      owner.daemon,
+      new RegExp(`handed thread ${threadId}'s tab its session`, "u"),
+      mark,
+    );
+    expect(tabs().map((tab) => tab.label)).toContain(`tr3x:${threadId}`);
   });
 });
