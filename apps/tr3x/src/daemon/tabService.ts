@@ -11,6 +11,7 @@ import {
   type OrchestrationV2ShellSnapshot,
   ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 
 import type { Tr3xPaths } from "../paths.ts";
@@ -223,7 +224,12 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
   const sessionForProject = async (projectId: string, label: string) => {
     const known = projectSessions.get(projectId);
     if (known !== undefined) return known;
-    const taken = new Set(projectSessions.values());
+    // A session holding tabs belongs to some project, even one tr3x can't name yet,
+    // such as a new thread's tab found again after a restart.
+    const taken = new Set([
+      ...projectSessions.values(),
+      ...[...tabs.values()].map((tab) => tab.sessionId),
+    ]);
     const sessions = await rex!.listSessions();
     return sessions.find((session) => session.label === label && !taken.has(session.sessionId))
       ?.sessionId;
@@ -454,6 +460,27 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
       : { thread: member, projects: snapshot.projects, archived: false };
   };
 
+  /** The older settled threads the shell left out, a page at a time, up to 1,000. */
+  const olderSettledThreads = async (snapshot: OrchestrationV2ShellSnapshot) => {
+    const found: ThreadShell[] = [];
+    let before: { settledAt: string; threadId?: ThreadId } | undefined =
+      snapshot.olderSettled === undefined ? undefined : { settledAt: snapshot.olderSettled.before };
+    try {
+      for (let page = 0; before !== undefined && page < 20; page += 1) {
+        const { threads } = await connection.olderSettledThreads({ before, limit: 50 });
+        found.push(...threads);
+        const last = threads.at(-1);
+        before =
+          threads.length < 50 || last?.settledAt == null
+            ? undefined
+            : { settledAt: DateTime.formatIso(last.settledAt), threadId: last.id };
+      }
+    } catch (error) {
+      log(`could not read older threads: ${describeError(error)}`);
+    }
+    return found;
+  };
+
   /** Resolves once the shell lists the thread as active, e.g. after unarchiving it. */
   const untilActive = (threadId: string) =>
     new Promise<void>((resolve, reject) => {
@@ -618,8 +645,12 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
           });
         const topLevel = (thread: ThreadShell) =>
           thread.lineage.relationshipToParent !== "subagent" && thread.deletedAt === null;
+        const listed = new Set(snapshot.threads.map((thread) => thread.id as string));
+        const older = (await olderSettledThreads(snapshot)).filter(
+          (thread) => !listed.has(thread.id),
+        );
         return [
-          ...snapshot.threads.filter(topLevel).map(entry(false)),
+          ...[...snapshot.threads, ...older].filter(topLevel).map(entry(false)),
           ...archive.threads.filter(topLevel).map(entry(true)),
         ];
       }

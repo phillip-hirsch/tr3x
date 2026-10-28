@@ -273,4 +273,63 @@ describe("tr3x daemon tabs", () => {
     );
     expect(tabs().map((tab) => tab.label)).toContain(`tr3x:${threadId}`);
   });
+
+  it("lists the older threads the shell leaves out, and keeps same-title projects apart after a restart", async () => {
+    const { dir, work, daemon, tr3x, apiConnection } = await setUp();
+    const first = daemon();
+    await waitForLine(first.daemon, /found 0 thread tab\(s\) in Rex/u);
+
+    // A new thread's tab before its first message: nothing ties it to its project after a restart.
+    const draft = JSON.parse(await tr3x("new", "--cwd", work)) as {
+      threadId: string;
+      sessionId: string;
+    };
+    await waitForLine(
+      first.daemon,
+      new RegExp(`handed thread ${draft.threadId}'s tab its session`, "u"),
+    );
+
+    // More settled threads than the shell keeps (25).
+    const connection = await apiConnection();
+    const root = NodeFS.realpathSync(work);
+    const project = (await connection.shellSnapshot(AbortSignal.timeout(20_000))).projects.find(
+      (candidate) => candidate.workspaceRoot === root,
+    )!;
+    const settled: string[] = [];
+    for (let index = 0; index < 27; index += 1) {
+      const threadId = ThreadId.make(NodeCrypto.randomUUID());
+      expect(
+        await connection.createThread({
+          threadId,
+          projectId: project.id,
+          title: `Settled ${index}`,
+          modelSelection: { instanceId: ProviderInstanceId.make("grok"), model: "grok-4.6" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        }),
+      ).toEqual({ ok: true });
+      expect(await connection.settleThread({ threadId })).toEqual({ ok: true });
+      settled.push(threadId);
+    }
+
+    first.daemon.child.kill("SIGKILL");
+    await first.stop();
+    const second = daemon();
+    await waitForLine(second.daemon, /found 1 thread tab\(s\) in Rex/u);
+
+    // A fresh shell leaves some of them out; Open Thread still lists them all.
+    const fresh = await (await apiConnection()).shellSnapshot(AbortSignal.timeout(20_000));
+    const omitted = fresh.olderSettled?.counts.reduce((sum, count) => sum + count.count, 0) ?? 0;
+    expect(omitted).toBeGreaterThan(0);
+    const listing = await tr3x("pick");
+    for (const threadId of settled) expect(listing).toContain(threadId);
+
+    // The draft's session is still its project's, not one for another project titled "work".
+    const otherWork = NodePath.join(dir, "elsewhere", "work");
+    NodeFS.mkdirSync(otherWork, { recursive: true });
+    const other = JSON.parse(await tr3x("new", "--cwd", otherWork)) as { sessionId: string };
+    expect(other.sessionId).not.toBe(draft.sessionId);
+  });
 });

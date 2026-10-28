@@ -3,9 +3,13 @@ import * as NodeReadline from "node:readline";
 
 import { controlRequest } from "./daemon/control.ts";
 import type { ThreadEntry } from "./daemon/tabService.ts";
+import { rexLabel } from "./daemon/tabs.ts";
 import type { Tr3xPaths } from "./paths.ts";
 import { makeRexClient } from "./rex/rex.ts";
 import { describeError } from "./redact.ts";
+
+/** Titles come from models and users: no control characters reach the terminal. */
+const shown = (text: string) => rexLabel(text, "");
 
 /** Threads whose title or project holds every word of `query`, waiting ones first. */
 export function filterThreads(
@@ -31,7 +35,7 @@ export function pickLines(
   return threads.slice(start, start + rows).map((thread, offset) => {
     const marker = thread.archived ? "a" : thread.blocked ? "!" : thread.open ? "•" : " ";
     const cursor = start + offset === selected ? ">" : " ";
-    return `${cursor} ${marker} ${thread.title}  (${thread.project})`;
+    return `${cursor} ${marker} ${shown(thread.title)}  (${shown(thread.project)})`;
   });
 }
 
@@ -58,7 +62,9 @@ export async function runPick(
           : thread.open
             ? "open"
             : "";
-      stdout.write(`${thread.threadId}\t${thread.title}\t${thread.project}\t${state}\n`);
+      stdout.write(
+        `${thread.threadId}\t${shown(thread.title)}\t${shown(thread.project)}\t${state}\n`,
+      );
     }
     return 0;
   }

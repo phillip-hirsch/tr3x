@@ -1,6 +1,8 @@
 import { Connection } from "@t3tools/client-runtime/connection";
 import {
   type ArchiveThreadInput,
+  type CreateThreadInput,
+  type SettleThreadInput,
   type UnarchiveThreadInput,
   cancelQueuedRun,
   createProject,
@@ -37,6 +39,7 @@ import {
 import {
   type EnvironmentId,
   ORCHESTRATION_V2_WS_METHODS,
+  type OrchestrationV2GetOlderSettledThreadsInput,
   type OrchestrationV2ShellSnapshot,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -101,6 +104,10 @@ export function createViewConnection(server: Platform.ViewServer) {
   const threadFamilyCommand = createEnvironmentRpcCommand(runtime, {
     label: "tr3x:thread-family",
     tag: ORCHESTRATION_V2_WS_METHODS.getThreadFamily,
+  });
+  const olderSettledCommand = createEnvironmentRpcCommand(runtime, {
+    label: "tr3x:older-settled",
+    tag: ORCHESTRATION_V2_WS_METHODS.getOlderSettledThreads,
   });
 
   /** A command's value, or its error thrown. */
@@ -188,6 +195,11 @@ export function createViewConnection(server: Platform.ViewServer) {
     archivedShell: () => query(archivedShellCommand, {}),
     /** The active threads in `threadId`'s family, including ones the shell left out as older settled. */
     threadFamily: (threadId: ThreadId) => query(threadFamilyCommand, { threadId }),
+    /** A page of the older settled threads a shell leaves out, below `before`. */
+    olderSettledThreads: (input: OrchestrationV2GetOlderSettledThreadsInput) =>
+      query(olderSettledCommand, input),
+    createThread: (input: CreateThreadInput) => run(threadCommands.create, input),
+    settleThread: (input: SettleThreadInput) => run(threadCommands.settle, input),
     loadEarlier: (threadId: ThreadId) => run(threadCommands.loadEarlierHistory, { threadId }),
     dispose: () => registry.dispose(),
   };
@@ -206,6 +218,9 @@ export type ViewApi = Omit<
   | "unarchiveThread"
   | "archivedShell"
   | "threadFamily"
+  | "olderSettledThreads"
+  | "createThread"
+  | "settleThread"
   | "dispose"
 >;
 
