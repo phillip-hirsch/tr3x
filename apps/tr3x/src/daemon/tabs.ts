@@ -22,17 +22,22 @@ const BLOCK_LABEL_PREFIX = "tr3x:";
 /** Rex's limit on window labels. */
 const MAX_LABEL = 128;
 
-/** The label that marks a block as a thread's tab, so a restarted daemon finds it again. */
-export function tabBlockLabel(threadId: string): string {
-  return `${BLOCK_LABEL_PREFIX}${threadId}`;
+/**
+ * The label that marks a block as a thread's tab, so a restarted daemon finds
+ * it again. A new thread's tab also names its project: until the first message
+ * launches the thread, nothing else ties the tab to it.
+ */
+export function tabBlockLabel(threadId: string, newThreadProjectId?: string): string {
+  const project = newThreadProjectId === undefined ? "" : `@${newThreadProjectId}`;
+  return `${BLOCK_LABEL_PREFIX}${threadId}${project}`;
 }
 
-/** The thread a block shows, when its label marks it as a tab. */
-export function threadIdOfBlockLabel(label: string): string | undefined {
-  const threadId = label.startsWith(BLOCK_LABEL_PREFIX)
-    ? label.slice(BLOCK_LABEL_PREFIX.length)
-    : "";
-  return /^[\w-]+$/u.test(threadId) ? threadId : undefined;
+/** The thread a block shows, and a new thread's project, when its label marks it as a tab. */
+export function parseTabBlockLabel(
+  label: string,
+): { readonly threadId: string; readonly projectId: string | undefined } | undefined {
+  const match = /^tr3x:([\w-]+)(?:@([\w-]+))?$/u.exec(label);
+  return match?.[1] === undefined ? undefined : { threadId: match[1], projectId: match[2] };
 }
 
 /** A Rex label for a title: no control characters, within Rex's limit, never empty. */

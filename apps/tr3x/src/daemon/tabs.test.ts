@@ -7,9 +7,9 @@ import {
   planShell,
   rexLabel,
   type TabView,
+  parseTabBlockLabel,
   tabBlockLabel,
   type ThreadShell,
-  threadIdOfBlockLabel,
 } from "./tabs.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
@@ -143,11 +143,18 @@ describe("nextBlockedThread", () => {
 });
 
 describe("tab labels", () => {
-  it("finds the thread in a tab's block label and nothing in other labels", () => {
-    expect(threadIdOfBlockLabel(tabBlockLabel("1b2c-3d"))).toBe("1b2c-3d");
-    expect(threadIdOfBlockLabel("shell")).toBeUndefined();
-    expect(threadIdOfBlockLabel("tr3x:")).toBeUndefined();
-    expect(threadIdOfBlockLabel("tr3x:a b")).toBeUndefined();
+  it("finds the thread, and a new thread's project, in a tab's block label", () => {
+    expect(parseTabBlockLabel(tabBlockLabel("1b2c-3d"))).toEqual({
+      threadId: "1b2c-3d",
+      projectId: undefined,
+    });
+    expect(parseTabBlockLabel(tabBlockLabel("1b2c-3d", "p-9"))).toEqual({
+      threadId: "1b2c-3d",
+      projectId: "p-9",
+    });
+    expect(parseTabBlockLabel("shell")).toBeUndefined();
+    expect(parseTabBlockLabel("tr3x:")).toBeUndefined();
+    expect(parseTabBlockLabel("tr3x:a b")).toBeUndefined();
   });
 
   it("keeps window labels within Rex's limit and never empty", () => {

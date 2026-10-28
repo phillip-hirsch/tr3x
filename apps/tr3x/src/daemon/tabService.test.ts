@@ -112,7 +112,8 @@ describe("tr3x daemon tabs", () => {
     const [tab] = tabs();
     expect(tabs()).toEqual([
       expect.objectContaining({
-        label: `tr3x:${threadId}`,
+        // A new thread's tab names its project until the thread exists.
+        label: expect.stringMatching(new RegExp(`^tr3x:${threadId}@[\\w-]+$`, "u")),
         sessionId: opened.sessionId,
         sessionLabel: "work",
         windowId: opened.windowId,
@@ -274,7 +275,7 @@ describe("tr3x daemon tabs", () => {
     expect(tabs().map((tab) => tab.label)).toContain(`tr3x:${threadId}`);
   });
 
-  it("lists the older threads the shell leaves out, and keeps same-title projects apart after a restart", async () => {
+  it("lists the older threads the shell leaves out, and keeps each project's session after a restart", async () => {
     const { dir, work, daemon, tr3x, apiConnection } = await setUp();
     const first = daemon();
     await waitForLine(first.daemon, /found 0 thread tab\(s\) in Rex/u);
@@ -331,5 +332,8 @@ describe("tr3x daemon tabs", () => {
     NodeFS.mkdirSync(otherWork, { recursive: true });
     const other = JSON.parse(await tr3x("new", "--cwd", otherWork)) as { sessionId: string };
     expect(other.sessionId).not.toBe(draft.sessionId);
+    // And the draft's own project still opens new threads there.
+    const same = JSON.parse(await tr3x("new", "--cwd", work)) as { sessionId: string };
+    expect(same.sessionId).toBe(draft.sessionId);
   });
 });

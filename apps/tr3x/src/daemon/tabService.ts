@@ -33,9 +33,9 @@ import {
   nextBlockedThread,
   planShell,
   rexLabel,
+  parseTabBlockLabel,
   tabBlockLabel,
   type ThreadShell,
-  threadIdOfBlockLabel,
 } from "./tabs.ts";
 
 const CLI = NodeURL.fileURLToPath(new URL("../cli.ts", import.meta.url));
@@ -261,7 +261,7 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     const sessionLabel = rexLabel(input.projectTitle, "tr3x");
     const window = {
       windowLabel: label,
-      blockLabel: tabBlockLabel(input.threadId),
+      blockLabel: tabBlockLabel(input.threadId, input.newThread ? input.projectId : undefined),
       command,
     };
     const sessionId = await sessionForProject(input.projectId, sessionLabel);
@@ -371,10 +371,13 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
   const rebuild = async () => {
     const sessions = await rex!.listSessions();
     const found = new Map<string, Tab>();
+    const newThreadProjects = new Map<string, string>();
     for (const session of sessions) {
       for (const block of await rex!.listBlocks(session.sessionId)) {
-        const threadId = threadIdOfBlockLabel(block.label);
-        if (threadId === undefined || found.has(threadId)) continue;
+        const parsed = parseTabBlockLabel(block.label);
+        if (parsed === undefined || found.has(parsed.threadId)) continue;
+        const { threadId } = parsed;
+        if (parsed.projectId !== undefined) newThreadProjects.set(threadId, parsed.projectId);
         // Keep a known tab's own object: a hand-off in flight checks it's still the same tab.
         const previous = tabs.get(threadId);
         found.set(
@@ -405,10 +408,14 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
       if (!live.has(sessionId)) projectSessions.delete(projectId);
     }
     const threads = Option.getOrNull(shellState().snapshot)?.threads ?? [];
-    for (const thread of threads) {
-      const tab = tabs.get(thread.id);
-      if (tab !== undefined && !projectSessions.has(thread.projectId)) {
-        projectSessions.set(thread.projectId, tab.sessionId);
+    const projectOf = new Map([
+      ...newThreadProjects,
+      ...threads.map((thread) => [thread.id as string, thread.projectId as string] as const),
+    ]);
+    for (const tab of tabs.values()) {
+      const projectId = projectOf.get(tab.threadId);
+      if (projectId !== undefined && !projectSessions.has(projectId)) {
+        projectSessions.set(projectId, tab.sessionId);
       }
     }
     mapped = true;
