@@ -294,9 +294,10 @@ describe("tr3x daemon tabs", () => {
       new RegExp(`handed thread ${draft.threadId}'s tab its session`, "u"),
     );
 
-    // Project A, also titled "work": more settled threads than the shell keeps (25).
+    // Project A, also titled "work", with an id shaped like upstream's MCP projects:
+    // more settled threads than the shell keeps (25).
     const connection = await apiConnection();
-    const projectId = ProjectId.make(NodeCrypto.randomUUID());
+    const projectId = ProjectId.make(`mcp:${NodeCrypto.randomUUID()}`);
     expect(
       await connection.createProject({ projectId, title: "work", workspaceRoot: work }),
     ).toEqual({ ok: true });

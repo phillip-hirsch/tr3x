@@ -152,6 +152,17 @@ describe("tab labels", () => {
       threadId: "1b2c-3d",
       projectId: undefined,
     });
+    // Upstream's MCP projects have ids like `mcp:<uuid>`; any id survives the trip.
+    for (const [threadId, projectId] of [
+      ["7f0c-1a", "mcp:9e2d-44"],
+      ["a@b c", "p:q@r/s"],
+    ] as const) {
+      expect(parseTabBlockLabel(tabBlockLabel(threadId, projectId))).toEqual({
+        threadId,
+        projectId,
+      });
+    }
+    expect(tabBlockLabel("t-1", "x".repeat(200))).toBe("tr3x:t-1");
     expect(parseTabBlockLabel("shell")).toBeUndefined();
     expect(parseTabBlockLabel("tr3x:")).toBeUndefined();
     expect(parseTabBlockLabel("tr3x:a b")).toBeUndefined();

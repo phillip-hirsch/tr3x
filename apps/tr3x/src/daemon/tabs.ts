@@ -19,24 +19,34 @@ export type ThreadShell = Pick<
 >;
 
 const BLOCK_LABEL_PREFIX = "tr3x:";
-/** Rex's limit on window labels. */
+/** Rex's limit on window and block labels. */
 const MAX_LABEL = 128;
 
 /**
- * The label that marks a block as a thread's tab, so a restarted daemon finds
- * it again. It names the project too: the shell can leave the thread out (an
- * older settled one, or a new one before its first message).
+ * A tab's block label, found again after a restart. It names the project too,
+ * since the shell can leave the thread out. Ids can hold any character, so both
+ * are percent-encoded; a project that won't fit in Rex's limit is left out.
  */
 export function tabBlockLabel(threadId: string, projectId: string): string {
-  return `${BLOCK_LABEL_PREFIX}${threadId}@${projectId}`;
+  const thread = `${BLOCK_LABEL_PREFIX}${encodeURIComponent(threadId)}`;
+  const withProject = `${thread}@${encodeURIComponent(projectId)}`;
+  return withProject.length <= MAX_LABEL ? withProject : thread;
 }
 
 /** The thread and project a block shows, when its label marks it as a tab. */
 export function parseTabBlockLabel(
   label: string,
 ): { readonly threadId: string; readonly projectId: string | undefined } | undefined {
-  const match = /^tr3x:([\w-]+)(?:@([\w-]+))?$/u.exec(label);
-  return match?.[1] === undefined ? undefined : { threadId: match[1], projectId: match[2] };
+  const match = /^tr3x:([^@\s]+)(?:@([^@\s]+))?$/u.exec(label);
+  if (match?.[1] === undefined) return undefined;
+  try {
+    return {
+      threadId: decodeURIComponent(match[1]),
+      projectId: match[2] === undefined ? undefined : decodeURIComponent(match[2]),
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 /** A Rex label for a title: no control characters, within Rex's limit, never empty. */
