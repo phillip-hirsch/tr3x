@@ -11,7 +11,6 @@ import {
   type OrchestrationV2ShellSnapshot,
   ThreadId,
 } from "@t3tools/contracts";
-import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 
 import type { Tr3xPaths } from "../paths.ts";
@@ -39,6 +38,9 @@ import {
   nextBlockedThread,
   planShell,
   rexLabel,
+  collectOlderSettled,
+  labelDigest,
+  OLDER_SETTLED_PAGE,
   parseTabBlockLabel,
   resolveLabelId,
   tabBlockLabel,
@@ -379,8 +381,9 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
    * plus archived and older settled ones when some label holds a digest. New
    * threads' ids are short UUIDs, never digests.
    */
-  const labelCandidates = async (needThreads: boolean, needProjects: boolean) => {
+  const labelCandidates = async (threadDigests: ReadonlyArray<string>, needProjects: boolean) => {
     const snapshot = requireShell();
+    const needThreads = threadDigests.length > 0;
     const archive =
       needThreads || needProjects
         ? await connection.archivedShell().catch((error: unknown) => {
@@ -388,10 +391,18 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
             return { projects: [], threads: [] };
           })
         : { projects: [], threads: [] };
-    const older = needThreads ? await olderSettledThreads(snapshot) : [];
     const ids = (items: ReadonlyArray<{ readonly id: string }>) => items.map((item) => item.id);
+    const known = [...ids(snapshot.threads), ...ids(archive.threads)];
+    // Page on until every digest resolves: an unresolved tab would be dropped and its session revoked.
+    const unresolved = (found: ReadonlyArray<{ readonly id: string }>) => {
+      const digests = new Set([...known, ...ids(found)].map(labelDigest));
+      return threadDigests.some((digest) => !digests.has(digest));
+    };
+    const older = unresolved([])
+      ? await olderSettledThreads(snapshot, (found) => !unresolved(found))
+      : [];
     return {
-      threadIds: [...ids(snapshot.threads), ...ids(archive.threads), ...ids(older)],
+      threadIds: [...known, ...ids(older)],
       projectIds: [...ids(snapshot.projects), ...ids(archive.projects)],
     };
   };
@@ -409,7 +420,7 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
       }
     }
     const { threadIds, projectIds } = await labelCandidates(
-      labelled.some((entry) => entry.thread.kind === "digest"),
+      labelled.flatMap((entry) => (entry.thread.kind === "digest" ? [entry.thread.digest] : [])),
       labelled.some((entry) => entry.project?.kind === "digest"),
     );
     const found = new Map<string, Tab>();
@@ -511,25 +522,33 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
       : { thread: member, projects: snapshot.projects, archived: false };
   };
 
-  /** The older settled threads the shell left out, a page at a time, up to 1,000. */
-  const olderSettledThreads = async (snapshot: OrchestrationV2ShellSnapshot) => {
-    const found: ThreadShell[] = [];
-    let before: { settledAt: string; threadId?: ThreadId } | undefined =
-      snapshot.olderSettled === undefined ? undefined : { settledAt: snapshot.olderSettled.before };
+  /** The older settled threads the shell left out, a page at a time, until `enough`. */
+  const olderSettledThreads = async (
+    snapshot: OrchestrationV2ShellSnapshot,
+    enough: (found: ReadonlyArray<ThreadShell>) => boolean,
+  ): Promise<ReadonlyArray<ThreadShell>> => {
+    if (snapshot.olderSettled === undefined) return [];
     try {
-      for (let page = 0; before !== undefined && page < 20; page += 1) {
-        const { threads } = await connection.olderSettledThreads({ before, limit: 50 });
-        found.push(...threads);
-        const last = threads.at(-1);
-        before =
-          threads.length < 50 || last?.settledAt == null
-            ? undefined
-            : { settledAt: DateTime.formatIso(last.settledAt), threadId: last.id };
-      }
+      return await collectOlderSettled(
+        (before) =>
+          connection
+            .olderSettledThreads({
+              before: {
+                settledAt: before.settledAt,
+                ...(before.threadId === undefined
+                  ? {}
+                  : { threadId: ThreadId.make(before.threadId) }),
+              },
+              limit: OLDER_SETTLED_PAGE,
+            })
+            .then((page) => page.threads),
+        snapshot.olderSettled.before,
+        enough,
+      );
     } catch (error) {
       log(`could not read older threads: ${describeError(error)}`);
+      return [];
     }
-    return found;
   };
 
   /** Resolves once the shell lists the thread as active, e.g. after unarchiving it. */
@@ -697,9 +716,10 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
         const topLevel = (thread: ThreadShell) =>
           thread.lineage.relationshipToParent !== "subagent" && thread.deletedAt === null;
         const listed = new Set(snapshot.threads.map((thread) => thread.id as string));
-        const older = (await olderSettledThreads(snapshot)).filter(
-          (thread) => !listed.has(thread.id),
-        );
+        // The picker lists up to 1,000 of them; `tr3x open` reaches any thread by id.
+        const older = (
+          await olderSettledThreads(snapshot, (found) => found.length >= 1_000)
+        ).filter((thread) => !listed.has(thread.id));
         return [
           ...[...snapshot.threads, ...older].filter(topLevel).map(entry(false)),
           ...archive.threads.filter(topLevel).map(entry(true)),

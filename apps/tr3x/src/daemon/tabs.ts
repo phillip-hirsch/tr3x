@@ -181,3 +181,36 @@ export function nextBlockedThread(
   const index = blocked.findIndex((thread) => thread.id === previous);
   return blocked[(index + 1) % Math.max(blocked.length, 1)];
 }
+
+/** The older settled threads a page request returns, at most this many at a time. */
+export const OLDER_SETTLED_PAGE = 50;
+
+/**
+ * Pages through the older settled threads below `before` (newest settle first)
+ * until a page comes back short or `enough` holds for what's been found.
+ */
+export async function collectOlderSettled<
+  Thread extends { readonly id: string; readonly settledAt: DateTime.Utc | null },
+>(
+  fetchPage: (before: {
+    readonly settledAt: string;
+    readonly threadId?: string;
+  }) => Promise<ReadonlyArray<Thread>>,
+  before: string,
+  enough: (found: ReadonlyArray<Thread>) => boolean,
+): Promise<ReadonlyArray<Thread>> {
+  const found: Thread[] = [];
+  let cursor: { readonly settledAt: string; readonly threadId?: string } | undefined = {
+    settledAt: before,
+  };
+  while (cursor !== undefined && !enough(found)) {
+    const page = await fetchPage(cursor);
+    found.push(...page);
+    const last = page.at(-1);
+    cursor =
+      page.length < OLDER_SETTLED_PAGE || last?.settledAt == null
+        ? undefined
+        : { settledAt: DateTime.formatIso(last.settledAt), threadId: last.id };
+  }
+  return found;
+}

@@ -3,7 +3,9 @@ import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  collectOlderSettled,
   nextBlockedThread,
+  OLDER_SETTLED_PAGE,
   planShell,
   rexLabel,
   type TabView,
@@ -178,5 +180,32 @@ describe("tab labels", () => {
     expect(rexLabel("x".repeat(200))).toHaveLength(128);
     expect(rexLabel("x".repeat(200)).endsWith("…")).toBe(true);
     expect(rexLabel(" \u0000 ")).toBe("New thread");
+  });
+});
+
+describe("collectOlderSettled", () => {
+  // 1,200 older settled threads, a minute apart: more than 20 pages.
+  const older = Array.from({ length: 1_200 }, (_, index) => ({
+    id: `older-${index}`,
+    settledAt: DateTime.subtract(at("2026-01-01T00:00:00.000Z"), { minutes: index }),
+  }));
+  /** The server's page: settled strictly before the cursor, newest first. */
+  const page = async (before: { readonly settledAt: string }) =>
+    older
+      .filter((thread) => DateTime.isLessThan(thread.settledAt, at(before.settledAt)))
+      .slice(0, OLDER_SETTLED_PAGE);
+
+  it("pages past 20 pages until it has what it needs, or runs out", async () => {
+    const start = "2026-01-01T00:00:01.000Z";
+    const target = "older-1100";
+    const found = await collectOlderSettled(page, start, (threads) =>
+      threads.some((thread) => thread.id === target),
+    );
+    expect(found.map((thread) => thread.id)).toContain(target);
+    expect(found).toHaveLength(1_150);
+    expect(await collectOlderSettled(page, start, () => false)).toHaveLength(1_200);
+    expect(await collectOlderSettled(page, start, (threads) => threads.length >= 100)).toHaveLength(
+      100,
+    );
   });
 });
