@@ -16,7 +16,13 @@ import * as Option from "effect/Option";
 
 import type { Tr3xPaths } from "../paths.ts";
 import { describeError } from "../redact.ts";
-import { makeRexClient, parseRexEvent, type RexEvent, resolveRexCli } from "../rex/rex.ts";
+import {
+  makeRexClient,
+  parseRexEvent,
+  type RexBlock,
+  type RexEvent,
+  resolveRexCli,
+} from "../rex/rex.ts";
 import { createViewConnection } from "../view/connection.ts";
 import { resolveProject } from "../view/resolveProject.ts";
 import { sessionBearer } from "../view/sessionBearer.ts";
@@ -34,6 +40,7 @@ import {
   planShell,
   rexLabel,
   parseTabBlockLabel,
+  resolveLabelId,
   tabBlockLabel,
   type ThreadShell,
 } from "./tabs.ts";
@@ -367,34 +374,71 @@ export async function startTabService(options: TabServiceOptions): Promise<TabSe
     }).catch((error: unknown) => log(`could not update tabs: ${describeError(error)}`));
   };
 
+  /**
+   * The ids a label's digest can stand for: the shell's threads and projects,
+   * plus archived and older settled ones when some label holds a digest. New
+   * threads' ids are short UUIDs, never digests.
+   */
+  const labelCandidates = async (needThreads: boolean, needProjects: boolean) => {
+    const snapshot = requireShell();
+    const archive =
+      needThreads || needProjects
+        ? await connection.archivedShell().catch((error: unknown) => {
+            log(`could not read the archive: ${describeError(error)}`);
+            return { projects: [], threads: [] };
+          })
+        : { projects: [], threads: [] };
+    const older = needThreads ? await olderSettledThreads(snapshot) : [];
+    const ids = (items: ReadonlyArray<{ readonly id: string }>) => items.map((item) => item.id);
+    return {
+      threadIds: [...ids(snapshot.threads), ...ids(archive.threads), ...ids(older)],
+      projectIds: [...ids(snapshot.projects), ...ids(archive.projects)],
+    };
+  };
+
   /** Rebuilds the map from the blocks Rex has, so a restarted daemon finds its tabs again. */
   const rebuild = async () => {
     const sessions = await rex!.listSessions();
-    const found = new Map<string, Tab>();
-    const labelledProjects = new Map<string, string>();
+    const labelled: Array<
+      { readonly block: RexBlock } & NonNullable<ReturnType<typeof parseTabBlockLabel>>
+    > = [];
     for (const session of sessions) {
       for (const block of await rex!.listBlocks(session.sessionId)) {
         const parsed = parseTabBlockLabel(block.label);
-        if (parsed === undefined || found.has(parsed.threadId)) continue;
-        const { threadId } = parsed;
-        if (parsed.projectId !== undefined) labelledProjects.set(threadId, parsed.projectId);
-        // Keep a known tab's own object: a hand-off in flight checks it's still the same tab.
-        const previous = tabs.get(threadId);
-        found.set(
-          threadId,
-          previous?.blockId === block.blockId
-            ? previous
-            : {
-                threadId,
-                sessionId: block.sessionId,
-                windowId: block.windowId,
-                blockId: block.blockId,
-                label: "",
-                lastSeen: undefined,
-                closed: false,
-              },
-        );
+        if (parsed !== undefined) labelled.push({ block, ...parsed });
       }
+    }
+    const { threadIds, projectIds } = await labelCandidates(
+      labelled.some((entry) => entry.thread.kind === "digest"),
+      labelled.some((entry) => entry.project?.kind === "digest"),
+    );
+    const found = new Map<string, Tab>();
+    const labelledProjects = new Map<string, string>();
+    for (const { block, thread, project } of labelled) {
+      const threadId = resolveLabelId(thread, threadIds);
+      if (threadId === undefined) {
+        log(`can't tell which thread block ${block.blockId} shows; leaving it alone`);
+        continue;
+      }
+      if (found.has(threadId)) continue;
+      const projectId = project === undefined ? undefined : resolveLabelId(project, projectIds);
+      if (projectId !== undefined) labelledProjects.set(threadId, projectId);
+      // Keep a known tab's own object: a hand-off in flight checks it's still the same tab.
+      const previous = tabs.get(threadId);
+      found.set(
+        threadId,
+        previous?.blockId === block.blockId
+          ? previous
+          : {
+              threadId,
+              sessionId: block.sessionId,
+              windowId: block.windowId,
+              blockId: block.blockId,
+              label: "",
+              lastSeen: undefined,
+              closed: false,
+            },
+      );
     }
     const firstMap = !mapped;
     tabs.clear();

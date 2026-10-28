@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off -- tr3x runs on Bun outside the Effect runtime.
+import * as NodeCrypto from "node:crypto";
 import { isOlderSettledThreadShell, type OrchestrationV2ThreadShell } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
@@ -19,34 +21,65 @@ export type ThreadShell = Pick<
 >;
 
 const BLOCK_LABEL_PREFIX = "tr3x:";
-/** Rex's limit on window and block labels. */
+/** Rex's limit on window labels. */
 const MAX_LABEL = 128;
+
+/** How a label names an id: the id itself, or a digest of an id too long to fit. */
+export type LabelId =
+  | { readonly kind: "id"; readonly id: string }
+  | { readonly kind: "digest"; readonly digest: string };
+
+/** Each id gets at most this much of the label, so both fit Rex's 128. */
+const MAX_LABEL_ID = 61;
+
+/** A short digest of an id; a label carries it, prefixed with `#`, when the id won't fit. */
+export function labelDigest(id: string): string {
+  return NodeCrypto.createHash("sha256").update(id).digest("base64url").slice(0, 22);
+}
+
+function labelId(id: string): string {
+  const encoded = encodeURIComponent(id);
+  return encoded.length <= MAX_LABEL_ID ? encoded : `#${labelDigest(id)}`;
+}
 
 /**
  * A tab's block label, found again after a restart. It names the project too,
- * since the shell can leave the thread out. Ids can hold any character, so both
- * are percent-encoded; a project that won't fit in Rex's limit is left out.
+ * since the shell can leave the thread out. Ids are percent-encoded, or given as
+ * a digest when too long (`#` never appears in an encoded id).
  */
 export function tabBlockLabel(threadId: string, projectId: string): string {
-  const thread = `${BLOCK_LABEL_PREFIX}${encodeURIComponent(threadId)}`;
-  const withProject = `${thread}@${encodeURIComponent(projectId)}`;
-  return withProject.length <= MAX_LABEL ? withProject : thread;
+  return `${BLOCK_LABEL_PREFIX}${labelId(threadId)}@${labelId(projectId)}`;
+}
+
+function parseLabelId(part: string): LabelId {
+  return part.startsWith("#")
+    ? { kind: "digest", digest: part.slice(1) }
+    : { kind: "id", id: decodeURIComponent(part) };
 }
 
 /** The thread and project a block shows, when its label marks it as a tab. */
 export function parseTabBlockLabel(
   label: string,
-): { readonly threadId: string; readonly projectId: string | undefined } | undefined {
+): { readonly thread: LabelId; readonly project: LabelId | undefined } | undefined {
   const match = /^tr3x:([^@\s]+)(?:@([^@\s]+))?$/u.exec(label);
   if (match?.[1] === undefined) return undefined;
   try {
     return {
-      threadId: decodeURIComponent(match[1]),
-      projectId: match[2] === undefined ? undefined : decodeURIComponent(match[2]),
+      thread: parseLabelId(match[1]),
+      project: match[2] === undefined ? undefined : parseLabelId(match[2]),
     };
   } catch {
     return undefined;
   }
+}
+
+/** The id a label names, among `candidates` when the label carries only its digest. */
+export function resolveLabelId(id: LabelId, candidates: Iterable<string>): string | undefined {
+  if (id.kind === "id") return id.id;
+  for (const candidate of candidates) {
+    if (labelDigest(candidate) === id.digest) return candidate;
+  }
+  return undefined;
 }
 
 /** A Rex label for a title: no control characters, within Rex's limit, never empty. */

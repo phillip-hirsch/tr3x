@@ -23,7 +23,7 @@ import { startScratchRex } from "../testing/rexFixture.ts";
 import { createViewConnection } from "../view/connection.ts";
 import { controlRequest } from "./control.ts";
 import { readDaemonState } from "./daemonState.ts";
-import { parseTabBlockLabel } from "./tabs.ts";
+import { type LabelId, parseTabBlockLabel } from "./tabs.ts";
 import { issueLocalSession, listLocalSessions } from "./localSession.ts";
 
 // Runs whatever happens to the test, last step first: daemons, then Rex (which
@@ -61,7 +61,16 @@ async function setUp() {
   const tabs = () =>
     rex.labelledBlocks().flatMap((block) => {
       const parsed = parseTabBlockLabel(block.label);
-      return parsed === undefined ? [] : [{ ...block, ...parsed }];
+      if (parsed === undefined) return [];
+      // Short ids show as themselves; a digest stands for an id too long for a label.
+      const id = (part: LabelId) => (part.kind === "id" ? part.id : `#${part.digest}`);
+      return [
+        {
+          ...block,
+          threadId: id(parsed.thread),
+          projectId: parsed.project === undefined ? undefined : id(parsed.project),
+        },
+      ];
     });
   const tabSessions = async (threadId: string) =>
     (await listLocalSessions(home, NODE_ENV)).filter(
@@ -294,16 +303,17 @@ describe("tr3x daemon tabs", () => {
       new RegExp(`handed thread ${draft.threadId}'s tab its session`, "u"),
     );
 
-    // Project A, also titled "work", with an id shaped like upstream's MCP projects:
-    // more settled threads than the shell keeps (25).
+    // Project A, also titled "work", with an id too long for a label: more settled
+    // threads than the shell keeps (25).
     const connection = await apiConnection();
-    const projectId = ProjectId.make(`mcp:${NodeCrypto.randomUUID()}`);
+    const projectId = ProjectId.make(`mcp:${"project ".repeat(12)}${NodeCrypto.randomUUID()}`);
     expect(
       await connection.createProject({ projectId, title: "work", workspaceRoot: work }),
     ).toEqual({ ok: true });
     const settled: string[] = [];
     for (let index = 0; index < 27; index += 1) {
-      const threadId = ThreadId.make(NodeCrypto.randomUUID());
+      // Ids too long for a Rex label, like app-owned delegated threads have.
+      const threadId = ThreadId.make(`delegated:${"é".repeat(30)}:${NodeCrypto.randomUUID()}`);
       expect(
         await connection.createThread({
           threadId,

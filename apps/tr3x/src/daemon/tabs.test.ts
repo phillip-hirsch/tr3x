@@ -8,6 +8,7 @@ import {
   rexLabel,
   type TabView,
   parseTabBlockLabel,
+  resolveLabelId,
   tabBlockLabel,
   type ThreadShell,
 } from "./tabs.ts";
@@ -143,26 +144,31 @@ describe("nextBlockedThread", () => {
 });
 
 describe("tab labels", () => {
-  it("finds the thread and its project in a tab's block label", () => {
-    expect(parseTabBlockLabel(tabBlockLabel("1b2c-3d", "p-9"))).toEqual({
-      threadId: "1b2c-3d",
-      projectId: "p-9",
+  it("names any thread and project in a tab's block label, within Rex's limit", () => {
+    const id = (threadId: string, projectId: string) =>
+      parseTabBlockLabel(tabBlockLabel(threadId, projectId));
+    expect(id("1b2c-3d", "p-9")).toEqual({
+      thread: { kind: "id", id: "1b2c-3d" },
+      project: { kind: "id", id: "p-9" },
     });
+    // Upstream's MCP projects have ids like `mcp:<uuid>`; any short id survives the trip.
+    expect(id("a@b c", "mcp:9e2d-44")).toEqual({
+      thread: { kind: "id", id: "a@b c" },
+      project: { kind: "id", id: "mcp:9e2d-44" },
+    });
+    // Ids too long to fit, even ones that grow when encoded, become digests that resolve back.
+    const longThread = `t:${"é".repeat(21)}`;
+    const longProject = "p".repeat(100);
+    const label = tabBlockLabel(longThread, longProject);
+    expect(label.length).toBeLessThanOrEqual(128);
+    const parsed = parseTabBlockLabel(label)!;
+    expect(resolveLabelId(parsed.thread, ["other", longThread])).toBe(longThread);
+    expect(resolveLabelId(parsed.project!, [longProject])).toBe(longProject);
+    expect(resolveLabelId(parsed.thread, ["other"])).toBeUndefined();
     expect(parseTabBlockLabel("tr3x:1b2c-3d")).toEqual({
-      threadId: "1b2c-3d",
-      projectId: undefined,
+      thread: { kind: "id", id: "1b2c-3d" },
+      project: undefined,
     });
-    // Upstream's MCP projects have ids like `mcp:<uuid>`; any id survives the trip.
-    for (const [threadId, projectId] of [
-      ["7f0c-1a", "mcp:9e2d-44"],
-      ["a@b c", "p:q@r/s"],
-    ] as const) {
-      expect(parseTabBlockLabel(tabBlockLabel(threadId, projectId))).toEqual({
-        threadId,
-        projectId,
-      });
-    }
-    expect(tabBlockLabel("t-1", "x".repeat(200))).toBe("tr3x:t-1");
     expect(parseTabBlockLabel("shell")).toBeUndefined();
     expect(parseTabBlockLabel("tr3x:")).toBeUndefined();
     expect(parseTabBlockLabel("tr3x:a b")).toBeUndefined();
