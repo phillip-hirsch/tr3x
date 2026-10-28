@@ -1,5 +1,6 @@
 import { Connection } from "@t3tools/client-runtime/connection";
 import {
+  type ArchiveThreadInput,
   cancelQueuedRun,
   createProject,
   type CancelQueuedRunInput,
@@ -102,6 +103,8 @@ export function createViewConnection(server: Platform.ViewServer) {
     registry,
     connectionStateAtom: catalog.stateAtom(environmentId),
     providersAtom: serverAtoms.providersValueAtom(environmentId),
+    /** The server's shell: projects, threads, and the removals since its last snapshot. */
+    shellStateAtom: shell.stateValueAtom(environmentId),
     thread: threadAtoms(details, environmentId),
     /**
      * The server's shell once it arrives; mounted only for as long as this waits.
@@ -151,6 +154,7 @@ export function createViewConnection(server: Platform.ViewServer) {
     setRuntimeMode: (input: SetThreadRuntimeModeInput) => run(threadCommands.setRuntimeMode, input),
     cancelQueuedRun: (input: CancelQueuedRunInput) => run(cancelQueuedCommand, input),
     createProject: (input: CreateProjectInput) => run(createProjectCommand, input),
+    archiveThread: (input: ArchiveThreadInput) => run(threadCommands.archive, input),
     loadEarlier: (threadId: ThreadId) => run(threadCommands.loadEarlierHistory, { threadId }),
     dispose: () => registry.dispose(),
   };
@@ -161,7 +165,12 @@ export type ViewConnection = ReturnType<typeof createViewConnection>;
 /** What the view reads and runs; the rest of `ViewConnection` serves startup. */
 export type ViewApi = Omit<
   ViewConnection,
-  "environmentId" | "shellSnapshot" | "createProject" | "dispose"
+  | "environmentId"
+  | "shellStateAtom"
+  | "shellSnapshot"
+  | "createProject"
+  | "archiveThread"
+  | "dispose"
 >;
 
 /**
