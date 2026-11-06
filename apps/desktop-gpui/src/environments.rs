@@ -1,0 +1,1547 @@
+//! Saved remote environments: the catalog this device keeps, pairing, and the connection
+//! diagnosis Settings › Environments shows. Ports the bearer route of
+//! `packages/client-runtime/src/connection/` (`onboarding.ts`, `compatibility.ts`,
+//! `diagnosis.ts`, `presentation.ts`) and `resolveRemotePairingTarget` in
+//! `packages/shared/src/remote.ts`. SSH and T3 Connect routes are not ported.
+//!
+//! Bearer tokens are stored encrypted by [`crate::secure_storage`] (the guarantee Electron's
+//! `safeStorage` gives the desktop app's connection catalog).
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context as _;
+use futures::FutureExt as _;
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use tokio::sync::{Notify, watch};
+use url::Url;
+
+use crate::backend::{self, Endpoint, LocalServer};
+use crate::secure_storage as secure;
+
+/// `ORCHESTRATION_PROTOCOL_VERSION` in `packages/contracts`.
+const ORCHESTRATION_PROTOCOL_VERSION: u64 = 2;
+/// `DEFAULT_REMOTE_REQUEST_TIMEOUT_MS` in `authorization/remote.ts`.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const RETRY_BASE_DELAY_MS: f64 = 1_000.;
+const RETRY_MAX_DELAY_MS: f64 = 300_000.;
+
+// ---------------------------------------------------------------------------------------------
+// Pairing input
+
+/// `parsePairingUrlFields` (`ConnectionsSettings.logic.ts`): a pasted pairing URL's host and code.
+pub fn parse_pairing_url(input: &str) -> Option<(String, String)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = if has_scheme(trimmed, true) {
+        trimmed.to_owned()
+    } else if let Some(rest) = trimmed.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        format!("https://{trimmed}")
+    };
+    let url = Url::parse(&candidate).ok()?;
+    if let Some(hosted) = hosted_pairing_request(&url) {
+        return Some(hosted);
+    }
+    Some((url.origin().ascii_serialization(), pairing_token(&url)?))
+}
+
+/// `parseRemotePairingFields`: the dialog's host and code, or a pairing URL pasted as the host.
+pub fn parse_remote_pairing_fields(host: &str, code: &str) -> Result<(String, String), &'static str> {
+    if let Some(parsed) = parse_pairing_url(host) {
+        return Ok(parsed);
+    }
+    match (host.trim(), code.trim()) {
+        ("", _) => Err("Enter a backend host."),
+        (_, "") => Err("Enter a pairing code."),
+        (host, code) => Ok((host.to_owned(), code.to_owned())),
+    }
+}
+
+/// `resolveRemotePairingTarget` for a host and code: the server's HTTP base, without a trailing slash.
+pub fn resolve_pairing_host(host: &str, code: &str) -> Result<String, &'static str> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("Enter a backend URL.");
+    }
+    let mut url = normalize_base_url(host)?;
+    if code.trim().is_empty() {
+        return Err("Enter a pairing code.");
+    }
+    let http = match url.scheme() {
+        "ws" => Some("http"),
+        "wss" => Some("https"),
+        _ => None,
+    };
+    if let Some(scheme) = http {
+        url.set_scheme(scheme).map_err(|()| "Backend URL is invalid.")?;
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+fn normalize_base_url(raw: &str) -> Result<Url, &'static str> {
+    const INVALID: &str = "Backend URL is invalid.";
+    let trimmed = raw.trim().trim_start_matches('/');
+    let input = if has_scheme(trimmed, false) { trimmed.to_owned() } else { format!("https://{trimmed}") };
+    let mut url = Url::parse(&input).map_err(|_| INVALID)?;
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return Err(INVALID);
+    }
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+/// `^[a-zA-Z][a-zA-Z\d+-]*:\/\/`, with `.` allowed in the scheme when `dot`.
+fn has_scheme(input: &str, dot: bool) -> bool {
+    let Some(end) = input.find("://") else { return false };
+    let mut chars = input[..end].chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || (dot && c == '.'))
+}
+
+fn first_param<'a>(
+    pairs: impl Iterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
+    name: &str,
+) -> Option<String> {
+    let value = pairs.into_iter().find(|(key, _)| key == name)?.1;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// `getPairingTokenFromUrl`: `#token=` first, then `?token=`.
+fn pairing_token(url: &Url) -> Option<String> {
+    let hash = url.fragment().unwrap_or_default();
+    first_param(url::form_urlencoded::parse(hash.as_bytes()), "token")
+        .or_else(|| first_param(url.query_pairs(), "token"))
+}
+
+/// `readHostedPairingRequest`: a hosted pairing page's `?host=` plus its token.
+fn hosted_pairing_request(url: &Url) -> Option<(String, String)> {
+    let host = first_param(url.query_pairs(), "host")?;
+    Some((host, pairing_token(url)?))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Connection failures
+
+/// `ConnectionTransientReason` and `ConnectionBlockedReason`, for the reasons a bearer route meets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    Network,
+    Timeout,
+    Transport,
+    RemoteUnavailable,
+    Authentication,
+    Configuration,
+    Permission,
+    Unsupported,
+}
+
+impl Reason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Reason::Network => "network",
+            Reason::Timeout => "timeout",
+            Reason::Transport => "transport",
+            Reason::RemoteUnavailable => "remote-unavailable",
+            Reason::Authentication => "authentication",
+            Reason::Configuration => "configuration",
+            Reason::Permission => "permission",
+            Reason::Unsupported => "unsupported",
+        }
+    }
+
+    /// A `ConnectionBlockedError`: the supervisor stops retrying until asked.
+    pub fn blocks(self) -> bool {
+        matches!(self, Reason::Authentication | Reason::Configuration | Reason::Permission | Reason::Unsupported)
+    }
+}
+
+/// `ConnectionHop`, for a direct route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hop {
+    Device,
+    Server,
+}
+
+/// `ConnectionAttemptError` for a direct route.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Failure {
+    pub reason: Reason,
+    pub detail: String,
+    pub hop: Option<Hop>,
+    pub server_update_required: bool,
+}
+
+impl Failure {
+    fn new(reason: Reason, detail: impl Into<String>, hop: Option<Hop>) -> Self {
+        Self { reason, detail: detail.into(), hop, server_update_required: false }
+    }
+
+    /// `mapRemoteEnvironmentError` for an HTTP status the server declares.
+    pub fn http(status: u16, url: &str) -> Self {
+        let (reason, detail) = match status {
+            401 => (Reason::Authentication, "The environment credential is invalid.".to_owned()),
+            403 => (Reason::Permission, "The environment credential does not grant the required access.".to_owned()),
+            400 => (Reason::Configuration, "The environment rejected the authentication request.".to_owned()),
+            404 => (Reason::Configuration, "The environment endpoint could not be found.".to_owned()),
+            500 => (Reason::RemoteUnavailable, "The environment could not authorize the connection.".to_owned()),
+            _ => (
+                Reason::RemoteUnavailable,
+                format!("Remote environment endpoint {url} returned undeclared status {status}."),
+            ),
+        };
+        Self::new(reason, detail, Some(Hop::Server))
+    }
+
+    /// `RemoteEnvironmentAuthTimeoutError` / `RemoteEnvironmentAuthFetchError`.
+    fn request(error: reqwest::Error, url: &str) -> Self {
+        if error.is_timeout() {
+            let detail =
+                format!("Remote environment endpoint {url} timed out after {}ms.", REQUEST_TIMEOUT.as_millis());
+            return Self::new(Reason::Timeout, detail, Some(Hop::Server));
+        }
+        // reqwest repeats the URL in its message; the root cause says what went wrong.
+        let mut cause: &dyn std::error::Error = &error;
+        while let Some(source) = cause.source() {
+            cause = source;
+        }
+        let detail = format!("Failed to fetch remote environment endpoint {url} ({cause}).");
+        Self::new(Reason::Network, detail, Some(Hop::Server))
+    }
+
+    fn invalid_json(url: &str) -> Self {
+        let detail = format!("Remote environment endpoint returned an invalid response from {url}.");
+        Self::new(Reason::RemoteUnavailable, detail, Some(Hop::Server))
+    }
+
+    /// `credentialMissingError`, or why a stored credential could not be decrypted.
+    pub fn credential_missing(environment: &SavedEnvironment) -> Self {
+        let id = environment.connection_id();
+        let detail = match &environment.credential {
+            Credential::Locked { error, .. } => {
+                let store = if cfg!(target_os = "macos") {
+                    "the Keychain"
+                } else if cfg!(windows) {
+                    "your Windows profile"
+                } else {
+                    "the keyring"
+                };
+                format!(
+                    "Connection credential {id} is saved, but this device could not decrypt it ({error}). It is kept: make {store} available to T3 Code, then retry."
+                )
+            }
+            Credential::Missing | Credential::Token(_) => format!("Connection credential {id} is unavailable."),
+        };
+        Self::new(Reason::Authentication, detail, Some(Hop::Device))
+    }
+
+    /// `environmentMismatchError`.
+    pub fn environment_mismatch(expected: &str, actual: &str) -> Self {
+        Self::new(Reason::Configuration, format!("Connected environment {actual} does not match {expected}."), None)
+    }
+
+    /// A socket that failed to open or closed.
+    pub fn transport(detail: impl Into<String>) -> Self {
+        Self::new(Reason::Transport, detail, Some(Hop::Server))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Descriptor and pairing
+
+/// `ExecutionEnvironmentDescriptor`, the fields this client reads.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Descriptor {
+    pub environment_id: String,
+    pub label: String,
+    #[serde(default)]
+    pub server_version: Option<String>,
+    #[serde(default)]
+    pub orchestration_protocol_version: Option<u64>,
+    #[serde(default)]
+    pub platform: Value,
+    #[serde(default)]
+    pub capabilities: Value,
+}
+
+impl Descriptor {
+    pub fn machine(&self) -> Option<String> {
+        self.platform["machine"].as_str().map(str::to_owned)
+    }
+
+    /// `orchestrationProtocolCompatibilityError`.
+    pub fn compatibility_error(&self) -> Option<Failure> {
+        let version = self.orchestration_protocol_version.unwrap_or(1);
+        if version == ORCHESTRATION_PROTOCOL_VERSION {
+            return None;
+        }
+        let label = &self.label;
+        Some(if version > ORCHESTRATION_PROTOCOL_VERSION {
+            let detail = format!(
+                "This client is not supported by this server. Update your app or use a compatible release to connect to {label}."
+            );
+            Failure::new(Reason::Unsupported, detail, None)
+        } else {
+            let detail = format!("This client requires a newer server. Update T3 Code on {label} to connect.");
+            Failure {
+                server_update_required: self.can_self_update(),
+                ..Failure::new(Reason::Unsupported, detail, None)
+            }
+        })
+    }
+
+    fn can_self_update(&self) -> bool {
+        match self.capabilities["serverSelfUpdate"].as_str() {
+            None => false,
+            Some("desktop-managed") => self.capabilities["desktopAppUpdate"] == Value::Bool(true),
+            Some(_) => true,
+        }
+    }
+}
+
+/// `fetchRemoteEnvironmentDescriptor`. Runs on the tokio runtime.
+pub async fn fetch_descriptor(http_base: &str) -> Result<Descriptor, Failure> {
+    let url = format!("{http_base}/.well-known/t3/environment");
+    let request = backend::http_client().get(&url).timeout(REQUEST_TIMEOUT);
+    let response = request.send().await.map_err(|error| Failure::request(error, &url))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Failure::http(status.as_u16(), &url));
+    }
+    response.json().await.map_err(|error| {
+        log::warn!("{url}: {error}");
+        Failure::invalid_json(&url)
+    })
+}
+
+/// `bootstrapRemoteBearerSession`: redeems a pairing code for a bearer session.
+async fn redeem_pairing_code(http_base: &str, code: &str) -> Result<String, Failure> {
+    let url = format!("{http_base}/oauth/token");
+    let os = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    let form = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
+        ("subject_token", code),
+        ("subject_token_type", "urn:t3:params:oauth:token-type:environment-bootstrap"),
+        ("requested_token_type", "urn:ietf:params:oauth:token-type:access_token"),
+        ("client_label", "T3 Code Desktop (GPUI)"),
+        ("client_device_type", "desktop"),
+        ("client_os", os),
+    ];
+    let request = backend::http_client().post(&url).form(&form).timeout(REQUEST_TIMEOUT);
+    let response = request.send().await.map_err(|error| Failure::request(error, &url))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Failure::http(status.as_u16(), &url));
+    }
+    let body: Value = response.json().await.map_err(|error| {
+        log::warn!("{url}: {error}");
+        Failure::invalid_json(&url)
+    })?;
+    body["access_token"].as_str().map(str::to_owned).ok_or_else(|| Failure::invalid_json(&url))
+}
+
+/// `preparePairingRegistration` for a host and pairing code. `saved` is the catalog, so a code
+/// for an address that would add a second route to a saved environment is refused unspent.
+/// Runs on the tokio runtime; errors are the dialog's message.
+pub async fn pair(host: String, code: String, saved: Vec<SavedEnvironment>) -> Result<SavedEnvironment, String> {
+    let http_base = resolve_pairing_host(&host, &code)?;
+    let descriptor = fetch_descriptor(&http_base).await.map_err(|failure| failure.detail)?;
+    if let Some(known) = saved.iter().find(|saved| saved.environment_id == descriptor.environment_id)
+        && known.http_base != http_base
+    {
+        return Err(format!(
+            "That address claims to be {}, which is already saved. Add it as a route from that environment's settings instead.",
+            known.label
+        ));
+    }
+    // An outdated server is still saved so it can be updated from this client.
+    if let Some(failure) = descriptor.compatibility_error()
+        && !failure.server_update_required
+    {
+        return Err(failure.detail);
+    }
+    let token = redeem_pairing_code(&http_base, code.trim()).await.map_err(|failure| failure.detail)?;
+    Ok(SavedEnvironment {
+        environment_id: descriptor.environment_id,
+        label: descriptor.label,
+        http_base,
+        enabled: true,
+        credential: Credential::Token(token),
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Catalog
+
+/// A paired environment (`BearerConnectionTarget` + profile + credential).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedEnvironment {
+    pub environment_id: String,
+    pub label: String,
+    /// `https://host:port`, no trailing slash.
+    pub http_base: String,
+    pub enabled: bool,
+    pub credential: Credential,
+}
+
+/// A saved environment's bearer token as this device holds it. `Debug` never prints the token.
+#[derive(Clone, PartialEq)]
+pub enum Credential {
+    /// Nothing is stored.
+    Missing,
+    Token(String),
+    /// Stored, but this run could not decrypt it: the keyring was locked, denied access or is
+    /// unavailable. Saving writes `stored` back unchanged, so a later run can still read it.
+    Locked {
+        stored: String,
+        error: String,
+    },
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("Missing"),
+            Self::Token(_) => f.write_str("Token(<redacted>)"),
+            Self::Locked { error, .. } => f.debug_struct("Locked").field("error", error).finish_non_exhaustive(),
+        }
+    }
+}
+
+impl Credential {
+    /// Tries a locked credential's decryption again, e.g. once the keyring is unlocked.
+    /// Blocks on the platform store, so it runs off the UI thread.
+    pub fn reopen(&self) -> Option<Self> {
+        match self {
+            Self::Locked { stored, .. } => Some(open_credential(stored.clone(), secure::unprotect)),
+            Self::Missing | Self::Token(_) => None,
+        }
+    }
+}
+
+impl SavedEnvironment {
+    /// `bearerConnectionId`.
+    pub fn connection_id(&self) -> String {
+        let origin = Url::parse(&self.http_base).map(|url| url.origin().ascii_serialization()).unwrap_or_default();
+        format!("bearer:{}:{origin}", self.environment_id)
+    }
+
+    /// `environmentMcpUrl` for a bearer route.
+    pub fn mcp_url(&self) -> String {
+        format!("{}/mcp", self.http_base)
+    }
+
+    pub fn endpoint(&self) -> Option<Endpoint> {
+        match &self.credential {
+            Credential::Token(token) => Some(Endpoint::bearer(&self.http_base, token.clone())),
+            Credential::Missing | Credential::Locked { .. } => None,
+        }
+    }
+}
+
+/// What this device keeps: the saved environments and the desktop app's
+/// `localEnvironmentEnabled` setting.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Catalog {
+    pub local_environment_enabled: bool,
+    pub environments: Vec<SavedEnvironment>,
+    /// The document as read. Saving writes back its fields this build does not know and the
+    /// entries it could not decode, so an older or newer build loses nothing.
+    stored: Map<String, Value>,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self { local_environment_enabled: true, environments: Vec::new(), stored: Map::new() }
+    }
+}
+
+/// The catalog the app shows and edits, from [`Catalog::open`].
+pub struct Opened {
+    pub catalog: Catalog,
+    /// The file could not be read, so saving would destroy it: saves are refused.
+    pub read_only: bool,
+    /// What went wrong reading the file, for Settings › Environments.
+    pub problem: Option<String>,
+}
+
+/// Why `environments.json` could not be used.
+#[derive(Debug, PartialEq)]
+enum Damage {
+    /// Not a catalog: invalid JSON, or the wrong shape.
+    Corrupt(String),
+    /// Not readable at all.
+    Unreadable(String),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredEnvironment {
+    environment_id: String,
+    label: String,
+    http_base_url: String,
+    #[serde(default = "enabled_default")]
+    enabled: bool,
+    /// The bearer token, encrypted by [`secure`], hex.
+    #[serde(default)]
+    encrypted_token: String,
+}
+
+fn enabled_default() -> bool {
+    true
+}
+
+impl Catalog {
+    fn path() -> Option<PathBuf> {
+        Some(crate::settings::userdata_dir()?.join("environments.json"))
+    }
+
+    /// Reads `<T3 home>/userdata/environments.json` to look something up; a missing or
+    /// unusable file is empty. Blocks on the file and the platform store.
+    pub fn load() -> Self {
+        let Some(path) = Self::path() else { return Self::default() };
+        read_at(&path, secure::unprotect)
+            .unwrap_or_else(|damage| {
+                log::warn!("{}: {damage:?}", path.display());
+                None
+            })
+            .unwrap_or_default()
+    }
+
+    /// Reads the catalog to show and edit, once per run. A file that is not a catalog is moved
+    /// aside to `environments.corrupt-<ms>.json` first, so a save cannot destroy it; one that
+    /// cannot be read makes the catalog read-only. Blocks on the file and the platform store.
+    pub fn open() -> Opened {
+        match Self::path() {
+            Some(path) => open_at(&path, secure::unprotect, crate::timestamp::now_ms()),
+            None => Opened { catalog: Self::default(), read_only: false, problem: None },
+        }
+    }
+
+    /// `unprotect` decrypts a stored token ([`secure::unprotect`] outside tests). The error
+    /// says why `document` is not a catalog.
+    fn from_document(document: Value, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Result<Self, String> {
+        let Value::Object(stored) = document else { return Err("the file is not a JSON object".into()) };
+        let entries = match stored.get("environments") {
+            None => &[][..],
+            Some(Value::Array(entries)) => entries.as_slice(),
+            Some(_) => return Err("`environments` is not a list".into()),
+        };
+        let environments = entries
+            .iter()
+            .filter_map(|entry| {
+                StoredEnvironment::deserialize(entry)
+                    .inspect_err(|error| log::warn!("keeping a saved environment this build cannot read: {error}"))
+                    .ok()
+            })
+            .map(|entry| SavedEnvironment {
+                credential: open_credential(entry.encrypted_token, &unprotect),
+                environment_id: entry.environment_id,
+                label: entry.label,
+                http_base: entry.http_base_url,
+                enabled: entry.enabled,
+            })
+            .collect();
+        let local_environment_enabled = stored.get("localEnvironmentEnabled") != Some(&Value::Bool(false));
+        Ok(Self { local_environment_enabled, environments, stored })
+    }
+
+    /// `protect` encrypts a token ([`secure::protect`] outside tests).
+    fn document(&self, protect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> anyhow::Result<Value> {
+        let read: &[Value] = self.stored.get("environments").and_then(Value::as_array).map_or(&[], Vec::as_slice);
+        let id = |entry: &Value| entry.get("environmentId").and_then(Value::as_str).map(str::to_owned);
+        let decodes = |entry: &Value| StoredEnvironment::deserialize(entry).is_ok();
+        let mut environments = self
+            .environments
+            .iter()
+            .map(|environment| {
+                let encrypted_token = match &environment.credential {
+                    Credential::Token(token) => {
+                        let sealed = protect(token.as_bytes())
+                            .map_err(|error| anyhow::anyhow!("could not encrypt a token: {error}"))?;
+                        backend::hex(&sealed)
+                    }
+                    Credential::Locked { stored, .. } => stored.clone(),
+                    Credential::Missing => String::new(),
+                };
+                let known = serde_json::to_value(StoredEnvironment {
+                    environment_id: environment.environment_id.clone(),
+                    label: environment.label.clone(),
+                    http_base_url: environment.http_base.clone(),
+                    enabled: environment.enabled,
+                    encrypted_token,
+                })
+                .context("could not encode an environment")?;
+                // Start from the entry as read, so fields this build does not know stay.
+                let mut entry = read
+                    .iter()
+                    .find(|entry| id(entry).as_ref() == Some(&environment.environment_id) && decodes(entry))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Value::Object(known) = known {
+                    entry.extend(known);
+                }
+                Ok(Value::Object(entry))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // Entries this build could not decode stay as read, unless one it saves replaced it.
+        let undecoded =
+            read.iter().filter(|entry| !decodes(entry) && id(entry).is_none_or(|id| self.get(&id).is_none()));
+        environments.extend(undecoded.cloned());
+        let mut document = self.stored.clone();
+        document.entry("version").or_insert(json!(1));
+        document.insert("localEnvironmentEnabled".into(), json!(self.local_environment_enabled));
+        document.insert("environments".into(), Value::Array(environments));
+        Ok(Value::Object(document))
+    }
+
+    /// Writes the catalog. Blocks on the file and the platform store.
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = Self::path().context("No T3 home directory.")?;
+        crate::settings::write_atomically(&path, &self.document(secure::protect)?)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
+    pub fn get(&self, environment_id: &str) -> Option<&SavedEnvironment> {
+        self.environments.iter().find(|environment| environment.environment_id == environment_id)
+    }
+
+    pub fn get_mut(&mut self, environment_id: &str) -> Option<&mut SavedEnvironment> {
+        self.environments.iter_mut().find(|environment| environment.environment_id == environment_id)
+    }
+
+    /// `EnvironmentRegistry.register` for one bearer route: replaces a saved entry with the same id.
+    pub fn upsert(&mut self, environment: SavedEnvironment) {
+        match self.get_mut(&environment.environment_id) {
+            Some(saved) => *saved = environment,
+            None => self.environments.push(environment),
+        }
+    }
+}
+
+/// A stored `encryptedToken`: empty is no credential; one that does not decrypt stays as stored.
+fn open_credential(stored: String, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Credential {
+    if stored.is_empty() {
+        return Credential::Missing;
+    }
+    let opened = unhex(&stored)
+        .ok_or_else(|| "The stored credential is not valid hex.".to_owned())
+        .and_then(|blob| unprotect(&blob))
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "The stored credential is not text.".to_owned()));
+    match opened {
+        Ok(token) => Credential::Token(token),
+        Err(error) => Credential::Locked { stored, error },
+    }
+}
+
+/// The catalog at `path`; `None` when there is no file.
+fn read_at(path: &Path, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Result<Option<Catalog>, Damage> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Damage::Unreadable(error.to_string())),
+    };
+    let document = serde_json::from_slice(&bytes).map_err(|error| Damage::Corrupt(error.to_string()))?;
+    Catalog::from_document(document, unprotect).map(Some).map_err(Damage::Corrupt)
+}
+
+/// [`Catalog::open`] for the file at `path`; `now_ms` names a corrupt file moved aside.
+fn open_at(path: &Path, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>, now_ms: i64) -> Opened {
+    let kept = "Changes to environments are not saved, so the file is kept.";
+    let (read_only, problem) = match read_at(path, unprotect) {
+        Ok(catalog) => return Opened { catalog: catalog.unwrap_or_default(), read_only: false, problem: None },
+        Err(Damage::Unreadable(error)) => {
+            log::warn!("could not read {}: {error}", path.display());
+            (true, format!("Saved environments could not be read ({error}). {kept}"))
+        }
+        Err(Damage::Corrupt(error)) => {
+            log::warn!("{} is not an environments catalog: {error}", path.display());
+            let aside = path.with_file_name(format!("environments.corrupt-{now_ms}.json"));
+            match std::fs::rename(path, &aside) {
+                Ok(()) => (
+                    false,
+                    format!(
+                        "Saved environments could not be read ({error}). The file was moved to {}.",
+                        aside.display()
+                    ),
+                ),
+                Err(rename) => {
+                    log::warn!("could not move {} aside: {rename}", path.display());
+                    (true, format!("Saved environments could not be read ({error}). {kept}"))
+                }
+            }
+        }
+    };
+    Opened { catalog: Catalog::default(), read_only, problem: Some(problem) }
+}
+
+/// `prepareBearerConnectionUpdate`'s label check.
+pub fn validate_label(label: &str) -> Result<String, &'static str> {
+    let label = label.trim();
+    if label.is_empty() { Err("Environment label cannot be empty.") } else { Ok(label.to_owned()) }
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if text.is_empty() || !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
+}
+
+/// The workspace's environment: `T3_SERVER_URL`, else the local server, or the first enabled
+/// saved environment while the local environment is off (Electron then starts no server).
+pub async fn resolve_workspace_endpoint() -> anyhow::Result<(Endpoint, Option<LocalServer>)> {
+    let overridden = std::env::var_os("T3_SERVER_URL").is_some() && std::env::var_os("T3_SERVER_TOKEN").is_some();
+    if !overridden {
+        // File IO and decrypting every token would block one of the runtime's two workers.
+        let catalog = tokio::task::spawn_blocking(Catalog::load).await.map_err(|error| {
+            log::error!("reading saved environments failed: {error}");
+            anyhow::anyhow!("Saved environments could not be read: {error}")
+        })?;
+        if !catalog.local_environment_enabled {
+            let endpoint = catalog
+                .environments
+                .iter()
+                .filter(|environment| environment.enabled)
+                .find_map(SavedEnvironment::endpoint);
+            let endpoint = endpoint.ok_or(backend::Unrecoverable(
+                "The local environment is off. Turn it on in Settings › Environments, or add an environment there."
+                    .into(),
+            ))?;
+            return Ok((endpoint, None));
+        }
+    }
+    backend::resolve_endpoint().await
+}
+
+/// The workspace's environment for the whole app run, started once and shared by every
+/// window, as Electron's backend manager outlives its windows: closing the window leaves this
+/// app's server and its agents running. Like `DesktopBackendManager`, a server that exits or
+/// fails to start is started again with a backoff; the server stops when the app quits.
+#[derive(Clone)]
+pub struct PrimaryBackend {
+    shared: Arc<Shared>,
+    status: watch::Receiver<BackendStatus>,
+}
+
+struct Shared {
+    status: watch::Sender<BackendStatus>,
+    /// Wakes a supervisor that waits to restart; see [`PrimaryBackend::restart`].
+    restart: Notify,
+}
+
+#[derive(Clone)]
+pub enum BackendStatus {
+    Starting,
+    Ready(Endpoint),
+    /// It went down, with why; a restart is scheduled.
+    Restarting(String),
+    /// It keeps failing to start, or cannot be started again (another server owns the T3
+    /// home). Only the first kind is still retried on its own.
+    Failed(String),
+}
+
+/// One start of the backend, as [`supervise`] sees it.
+enum Start {
+    /// `exited` resolves with why this app's server stopped, or `None` once the app quits. It
+    /// is `None` for a server this app does not run.
+    Ready {
+        endpoint: Endpoint,
+        exited: Option<BoxFuture<'static, Option<String>>>,
+    },
+    /// `retry` is false when starting again cannot help.
+    Failed {
+        reason: String,
+        retry: bool,
+    },
+    Quit,
+}
+
+/// `INITIAL_RESTART_DELAY` and `MAX_RESTART_DELAY` in `DesktopBackendManager.ts`.
+const INITIAL_RESTART_DELAY: Duration = Duration::from_millis(500);
+const MAX_RESTART_DELAY: Duration = Duration::from_secs(10);
+/// `STARTUP_FAILURE_RESTART_ATTEMPTS`: restarts without readiness before the failure shows.
+const STARTUP_FAILURE_RESTART_ATTEMPTS: u32 = 3;
+
+impl gpui_kit::Global for PrimaryBackend {}
+
+impl PrimaryBackend {
+    pub fn start(runtime: &tokio::runtime::Handle) -> Self {
+        let backend = Self::new();
+        runtime.spawn(supervise(backend.shared.clone(), start_workspace));
+        backend
+    }
+
+    fn new() -> Self {
+        let (status, receiver) = watch::channel(BackendStatus::Starting);
+        Self { shared: Arc::new(Shared { status, restart: Notify::new() }), status: receiver }
+    }
+
+    /// The status now; [`Self::changed`] then waits for the next one.
+    pub fn status(&mut self) -> BackendStatus {
+        self.status.borrow_and_update().clone()
+    }
+
+    pub async fn changed(&mut self) {
+        // `shared` holds the sender, so the channel never closes.
+        let _ = self.status.changed().await;
+    }
+
+    /// Starts a backend that is down again now, skipping the backoff (Reconnect, a new window).
+    pub fn restart(&self) {
+        let down = self.shared.status.send_if_modified(|status| {
+            let down = matches!(status, BackendStatus::Restarting(_) | BackendStatus::Failed(_));
+            if down {
+                *status = BackendStatus::Starting;
+            }
+            down
+        });
+        if down {
+            self.shared.restart.notify_waiters();
+        }
+    }
+}
+
+/// [`resolve_workspace_endpoint`] for [`supervise`].
+async fn start_workspace() -> Start {
+    if backend::quitting_now() {
+        return Start::Quit;
+    }
+    match resolve_workspace_endpoint().await {
+        Ok((endpoint, server)) => Start::Ready { endpoint, exited: server.map(|server| server.run().boxed()) },
+        Err(_) if backend::quitting_now() => Start::Quit,
+        Err(error) => Start::Failed {
+            retry: error.downcast_ref::<backend::Unrecoverable>().is_none(),
+            reason: format!("{error:#}"),
+        },
+    }
+}
+
+/// Starts the backend and keeps it running: `scheduleRestart` in `DesktopBackendManager.ts`.
+async fn supervise<F, Fut>(shared: Arc<Shared>, mut start: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Start>,
+{
+    // Restarts since the server was last ready (`restartAttempt`).
+    let mut attempt = 0;
+    loop {
+        let reason = match start().await {
+            Start::Quit => return,
+            Start::Ready { endpoint, exited } => {
+                log::info!("server ready at {}", endpoint.http_base);
+                attempt = 0;
+                shared.status.send_replace(BackendStatus::Ready(endpoint));
+                let Some(exited) = exited else { return };
+                let Some(reason) = exited.await else { return };
+                reason
+            }
+            Start::Failed { reason, retry: false } => {
+                log::error!("{reason}");
+                // Created before the status changes, so a restart that sees it wakes this.
+                let restart = shared.restart.notified();
+                shared.status.send_replace(BackendStatus::Failed(reason));
+                restart.await;
+                continue;
+            }
+            Start::Failed { reason, retry: true } => reason,
+        };
+        attempt += 1;
+        let delay = restart_delay(attempt);
+        log::warn!("{reason} Restarting in {delay:?}.");
+        let restart = shared.restart.notified();
+        shared.status.send_replace(if attempt >= STARTUP_FAILURE_RESTART_ATTEMPTS {
+            BackendStatus::Failed(reason)
+        } else {
+            BackendStatus::Restarting(reason)
+        });
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = restart => {}
+        }
+    }
+}
+
+/// `calculateRestartDelay` for the `attempt`th restart since the server was ready.
+fn restart_delay(attempt: u32) -> Duration {
+    INITIAL_RESTART_DELAY.saturating_mul(1 << attempt.saturating_sub(1).min(5)).min(MAX_RESTART_DELAY)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Supervisor state and presentation
+
+/// `SupervisorConnectionPhase`, without the network probe's `offline`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    #[default]
+    Available,
+    Connecting,
+    Backoff,
+    Connected,
+    Blocked,
+}
+
+/// `SupervisorConnectionState`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConnectionState {
+    pub phase: Phase,
+    pub attempt: u32,
+    pub last_failure: Option<Failure>,
+    /// Epoch ms.
+    pub retry_at: Option<i64>,
+}
+
+/// `retryDelayMs`: exponential from 1 s to 5 min, half of it jittered by `random` in 0..=1.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a delay capped at the maximum backoff")]
+pub fn retry_delay_ms(failure_count: u32, random: f64) -> u64 {
+    let ceiling =
+        RETRY_MAX_DELAY_MS.min(RETRY_BASE_DELAY_MS * 2f64.powi(i32::try_from(failure_count.min(30)).unwrap_or(30) + 1));
+    (ceiling / 2. + ceiling / 2. * random).round() as u64
+}
+
+/// `EnvironmentConnectionPhase` (`presentConnectionState`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presented {
+    Available,
+    Connecting,
+    Reconnecting,
+    Connected,
+    Error,
+    Unsupported,
+}
+
+impl ConnectionState {
+    pub fn presented(&self) -> Presented {
+        match self.phase {
+            Phase::Available => Presented::Available,
+            Phase::Connecting if self.attempt <= 1 && self.last_failure.is_none() => Presented::Connecting,
+            Phase::Connecting | Phase::Backoff => Presented::Reconnecting,
+            Phase::Connected => Presented::Connected,
+            Phase::Blocked if self.last_failure.as_ref().is_some_and(|f| f.reason == Reason::Unsupported) => {
+                Presented::Unsupported
+            }
+            Phase::Blocked => Presented::Error,
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self.phase {
+            Phase::Connecting | Phase::Backoff | Phase::Blocked => {
+                self.last_failure.as_ref().map(|f| f.detail.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// `connectionStatusText`.
+    pub fn status_text(&self) -> String {
+        match (self.presented(), self.error()) {
+            (Presented::Available, _) => "Available".into(),
+            (Presented::Connecting, _) => "Connecting...".into(),
+            (Presented::Reconnecting, Some(error)) => format!("Failed to connect. Reconnecting... Reason: {error}"),
+            (Presented::Reconnecting, None) => "Reconnecting...".into(),
+            (Presented::Connected, _) => "Connected".into(),
+            (Presented::Unsupported, _) => "Client not supported".into(),
+            (Presented::Error, Some(error)) => format!("Connection failed. Reason: {error}"),
+            (Presented::Error, None) => "Connection failed".into(),
+        }
+    }
+
+    /// `savedBackendStatus`: the row's status and whether it reads as an error.
+    pub fn saved_status(&self, enabled: bool) -> (String, bool) {
+        let presented = self.presented();
+        if !enabled && presented != Presented::Unsupported {
+            return ("Off".into(), false);
+        }
+        match (presented, self.error()) {
+            (Presented::Connected, _) => ("Connected".into(), false),
+            (Presented::Connecting, _) => ("Connecting".into(), false),
+            (Presented::Reconnecting, Some(error)) => (format!("Reconnecting: {error}"), true),
+            (Presented::Reconnecting, None) => ("Reconnecting".into(), true),
+            (Presented::Unsupported, _) => ("Client not supported".into(), false),
+            (Presented::Error, Some(error)) => (format!("Connection failed: {error}"), true),
+            (Presented::Error, None) => ("Connection failed".into(), true),
+            (Presented::Available, _) => ("Not connected".into(), false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HopResult {
+    Ok,
+    Failed,
+    Unchecked,
+}
+
+/// `ConnectionDiagnosis` for a direct route.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Diagnosis {
+    pub headline: String,
+    pub hops: Vec<(String, HopResult)>,
+    pub steps: Vec<String>,
+    pub facts: Vec<(&'static str, String)>,
+}
+
+/// `presentConnectionDiagnosis` for a direct route; `None` when nothing failed. The caller
+/// asks only for an enabled environment that is not connected or unsupported.
+pub fn diagnose(host: &str, state: &ConnectionState, server_version: Option<&str>) -> Option<Diagnosis> {
+    let failure = state.last_failure.as_ref()?;
+    let outdated = failure.server_update_required;
+    // A failure that names no hop was guessed to be the server, so nothing before it was probed.
+    let (hop, guessed) = match (outdated, failure.hop) {
+        (true, _) => (Hop::Server, false),
+        (false, Some(hop)) => (hop, false),
+        (false, None) => (Hop::Server, true),
+    };
+    let refused = matches!(failure.reason, Reason::Authentication | Reason::Permission);
+    let headline = match hop {
+        _ if outdated => format!("{host} runs an older T3 Code"),
+        Hop::Device => "This device could not prepare the connection".into(),
+        Hop::Server if refused => format!("T3 Code on {host} did not accept this device"),
+        Hop::Server => format!("T3 Code on {host} did not answer"),
+    };
+    let steps = match hop {
+        _ if outdated => vec![format!("Update T3 Code on {host}.")],
+        Hop::Device => vec![
+            "Restart T3 Code on this device.".into(),
+            format!("If it keeps failing, remove {host} from this device and add it again."),
+        ],
+        Hop::Server => {
+            vec![
+                format!("Make sure T3 Code is running on {host}."),
+                "Retry. If it keeps failing, copy the diagnostics.".into(),
+            ]
+        }
+    };
+    let failed = match hop {
+        Hop::Device => 0,
+        Hop::Server => 1,
+    };
+    let hops = ["This device".to_owned(), format!("T3 Code on {host}")]
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let result = if index == failed {
+                HopResult::Failed
+            } else if index < failed && !guessed {
+                HopResult::Ok
+            } else {
+                HopResult::Unchecked
+            };
+            (label, result)
+        })
+        .collect();
+    let mut facts = Vec::new();
+    let mut add = |label: &'static str, value: Option<String>| {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            facts.push((label, value));
+        }
+    };
+    add("Cause", Some(if outdated { "outdated".into() } else { failure.reason.as_str().into() }));
+    add("Attempts", (state.attempt > 0).then(|| state.attempt.to_string()));
+    add("Next retry", state.retry_at.and_then(iso_time));
+    add("Route", Some("Direct".into()));
+    add("App version", Some(env!("CARGO_PKG_VERSION").into()));
+    add("Host version", server_version.map(str::to_owned));
+    add("Error", Some(failure.detail.clone()));
+    Some(Diagnosis { headline, hops, steps, facts })
+}
+
+/// `DateTime.formatIso`.
+fn iso_time(epoch_ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(epoch_ms)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+/// `connectionDiagnosisText`: one plain-text block for bug reports.
+pub fn diagnosis_text(host: &str, diagnosis: &Diagnosis) -> String {
+    let mut lines = vec![format!("T3 Code connection to {host}: {}", diagnosis.headline), String::new()];
+    lines.extend(diagnosis.hops.iter().map(|(label, result)| {
+        let mark = match result {
+            HopResult::Ok => "ok",
+            HopResult::Failed => "FAILED",
+            HopResult::Unchecked => "not checked",
+        };
+        format!("{label}: {mark}")
+    }));
+    lines.push(String::new());
+    lines.extend(diagnosis.facts.iter().map(|(label, value)| format!("{label}: {value}")));
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs [`supervise`] over `starts`, one per start; it panics when they run out.
+    fn supervised(starts: Vec<Start>) -> PrimaryBackend {
+        let backend = PrimaryBackend::new();
+        let mut starts = std::collections::VecDeque::from(starts);
+        tokio::spawn(supervise(backend.shared.clone(), move || {
+            std::future::ready(starts.pop_front().expect("no start left"))
+        }));
+        backend
+    }
+
+    /// A server at `http_base` that runs until `exit` sends why, or drops for a quit.
+    fn running(http_base: &str) -> (Start, tokio::sync::oneshot::Sender<String>) {
+        let (exit, exited) = tokio::sync::oneshot::channel::<String>();
+        let endpoint = Endpoint::bearer(http_base, String::new());
+        (Start::Ready { endpoint, exited: Some(async { exited.await.ok() }.boxed()) }, exit)
+    }
+
+    fn failed(reason: &str, retry: bool) -> Start {
+        Start::Failed { reason: reason.into(), retry }
+    }
+
+    /// The next status, as `ready <base>`, `restarting <why>`, `failed <why>` or `starting`.
+    async fn next(backend: &mut PrimaryBackend) -> String {
+        backend.changed().await;
+        describe(&backend.status())
+    }
+
+    fn describe(status: &BackendStatus) -> String {
+        match status {
+            BackendStatus::Starting => "starting".into(),
+            BackendStatus::Ready(endpoint) => format!("ready {}", endpoint.http_base),
+            BackendStatus::Restarting(reason) => format!("restarting {reason}"),
+            BackendStatus::Failed(reason) => format!("failed {reason}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_server_restarts_after_the_backoff() {
+        let (first, crash) = running("http://a");
+        let (second, _keep) = running("http://b");
+        let mut backend = supervised(vec![first, second]);
+        assert_eq!(describe(&backend.status()), "starting");
+        assert_eq!(next(&mut backend).await, "ready http://a");
+        crash.send("crashed".into()).unwrap();
+        assert_eq!(next(&mut backend).await, "restarting crashed");
+        let down = tokio::time::Instant::now();
+        assert_eq!(next(&mut backend).await, "ready http://b");
+        assert_eq!(down.elapsed(), INITIAL_RESTART_DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_first_starts_back_off_then_show_and_restart_on_request() {
+        let (server, _keep) = running("http://a");
+        let starts = vec![failed("no node", true), failed("no node", true), failed("no node", true), server];
+        let mut backend = supervised(starts);
+        let started = tokio::time::Instant::now();
+        assert_eq!(next(&mut backend).await, "restarting no node");
+        assert_eq!(next(&mut backend).await, "restarting no node");
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+        // The third restart without readiness shows the failure, as Electron's startup failure.
+        assert_eq!(next(&mut backend).await, "failed no node");
+        assert_eq!(started.elapsed(), Duration::from_millis(1_500));
+        // Reconnect skips the 2 s still to wait.
+        backend.restart();
+        assert_eq!(describe(&backend.status()), "starting");
+        assert_eq!(next(&mut backend).await, "ready http://a");
+        assert_eq!(started.elapsed(), Duration::from_millis(1_500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unrecoverable_start_waits_for_a_restart_request() {
+        let (server, _keep) = running("http://a");
+        let mut backend = supervised(vec![failed("home owned", false), server]);
+        assert_eq!(next(&mut backend).await, "failed home owned");
+        tokio::time::sleep(MAX_RESTART_DELAY * 6).await;
+        assert_eq!(describe(&backend.status()), "failed home owned");
+        backend.restart();
+        assert_eq!(describe(&backend.status()), "starting");
+        assert_eq!(next(&mut backend).await, "ready http://a");
+        // A restart request while it runs changes nothing.
+        backend.restart();
+        assert_eq!(describe(&backend.status()), "ready http://a");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quitting_stops_supervision() {
+        let (server, quit) = running("http://a");
+        let mut backend = supervised(vec![server]);
+        assert_eq!(next(&mut backend).await, "ready http://a");
+        drop(quit);
+        tokio::time::sleep(MAX_RESTART_DELAY * 6).await;
+        assert_eq!(describe(&backend.status()), "ready http://a");
+    }
+
+    #[test]
+    fn restart_delays_double_up_to_ten_seconds() {
+        let delays: Vec<_> = (1..=7).map(|attempt| restart_delay(attempt).as_millis()).collect();
+        assert_eq!(delays, [500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000]);
+    }
+
+    #[test]
+    fn pairing_urls_fill_host_and_code() {
+        assert_eq!(
+            parse_pairing_url("http://127.0.0.1:3999/pair#token=ABC123"),
+            Some(("http://127.0.0.1:3999".into(), "ABC123".into()))
+        );
+        assert_eq!(parse_pairing_url("box.ts.net/?token=XY"), Some(("https://box.ts.net".into(), "XY".into())));
+        // A hosted pairing page names the backend in `host`.
+        assert_eq!(
+            parse_pairing_url("https://app.t3.codes/pair?host=box.example.com&label=Box#token=T1"),
+            Some(("box.example.com".into(), "T1".into()))
+        );
+        // An empty hash token falls back to the query.
+        assert_eq!(parse_pairing_url("https://h/pair?token=Q#token="), Some(("https://h".into(), "Q".into())));
+        assert_eq!(parse_pairing_url("backend.example.com"), None);
+        assert_eq!(parse_pairing_url("   "), None);
+    }
+
+    #[test]
+    fn remote_pairing_fields_need_a_host_and_a_code() {
+        assert_eq!(parse_remote_pairing_fields("", "CODE"), Err("Enter a backend host."));
+        assert_eq!(parse_remote_pairing_fields("box", " "), Err("Enter a pairing code."));
+        assert_eq!(parse_remote_pairing_fields(" box ", " C "), Ok(("box".into(), "C".into())));
+        assert_eq!(parse_remote_pairing_fields("http://h:1/#token=T", ""), Ok(("http://h:1".into(), "T".into())));
+    }
+
+    #[test]
+    fn pairing_hosts_normalize_to_an_http_base() {
+        assert_eq!(resolve_pairing_host("box.example.com", "C"), Ok("https://box.example.com".into()));
+        assert_eq!(resolve_pairing_host("//box:8080/some/path?x=1#y", "C"), Ok("https://box:8080".into()));
+        assert_eq!(resolve_pairing_host("http://127.0.0.1:3999/", "C"), Ok("http://127.0.0.1:3999".into()));
+        assert_eq!(resolve_pairing_host("wss://box.example.com", "C"), Ok("https://box.example.com".into()));
+        assert_eq!(resolve_pairing_host("ws://box:80", "C"), Ok("http://box".into()));
+        assert_eq!(resolve_pairing_host("ftp://box", "C"), Err("Backend URL is invalid."));
+        assert_eq!(resolve_pairing_host("  ", "C"), Err("Enter a backend URL."));
+        assert_eq!(resolve_pairing_host("box", ""), Err("Enter a pairing code."));
+    }
+
+    fn descriptor(version: Option<u64>, capabilities: Value) -> Descriptor {
+        Descriptor {
+            environment_id: "env".into(),
+            label: "Box".into(),
+            server_version: None,
+            orchestration_protocol_version: version,
+            platform: Value::Null,
+            capabilities,
+        }
+    }
+
+    #[test]
+    fn protocol_compatibility_matches_the_web() {
+        assert_eq!(descriptor(Some(2), json!({})).compatibility_error(), None);
+        let newer = descriptor(Some(3), json!({})).compatibility_error().unwrap();
+        assert_eq!(newer.reason, Reason::Unsupported);
+        assert!(newer.detail.starts_with("This client is not supported by this server."));
+        let older = descriptor(None, json!({})).compatibility_error().unwrap();
+        assert_eq!(older.detail, "This client requires a newer server. Update T3 Code on Box to connect.");
+        assert!(!older.server_update_required);
+        assert!(
+            descriptor(Some(1), json!({"serverSelfUpdate": "npm"}))
+                .compatibility_error()
+                .unwrap()
+                .server_update_required
+        );
+        let managed = json!({"serverSelfUpdate": "desktop-managed"});
+        assert!(!descriptor(Some(1), managed).compatibility_error().unwrap().server_update_required);
+        let managed = json!({"serverSelfUpdate": "desktop-managed", "desktopAppUpdate": true});
+        assert!(descriptor(Some(1), managed).compatibility_error().unwrap().server_update_required);
+    }
+
+    #[test]
+    fn retry_delays_double_up_to_five_minutes() {
+        assert_eq!(retry_delay_ms(0, 0.), 1_000);
+        assert_eq!(retry_delay_ms(0, 1.), 2_000);
+        assert_eq!(retry_delay_ms(2, 0.5), 6_000);
+        assert_eq!(retry_delay_ms(20, 1.), 300_000);
+        assert_eq!(retry_delay_ms(u32::MAX, 0.), 150_000);
+    }
+
+    fn state(phase: Phase, attempt: u32, failure: Option<Failure>) -> ConnectionState {
+        ConnectionState { phase, attempt, last_failure: failure, retry_at: None }
+    }
+
+    #[test]
+    fn saved_status_reads_like_the_web_row() {
+        let refused = Failure::http(401, "x");
+        assert_eq!(state(Phase::Connected, 1, None).saved_status(false), ("Off".into(), false));
+        assert_eq!(state(Phase::Connecting, 1, None).saved_status(true), ("Connecting".into(), false));
+        assert_eq!(
+            state(Phase::Backoff, 2, Some(Failure::transport("closed"))).saved_status(true),
+            ("Reconnecting: closed".into(), true)
+        );
+        assert_eq!(
+            state(Phase::Blocked, 1, Some(refused.clone())).saved_status(true),
+            ("Connection failed: The environment credential is invalid.".into(), true)
+        );
+        assert_eq!(
+            state(Phase::Blocked, 1, Some(refused)).status_text(),
+            "Connection failed. Reason: The environment credential is invalid."
+        );
+        let unsupported = descriptor(Some(3), json!({})).compatibility_error();
+        assert_eq!(state(Phase::Blocked, 1, unsupported).saved_status(false), ("Client not supported".into(), false));
+    }
+
+    #[test]
+    fn diagnosis_names_the_failed_hop() {
+        assert_eq!(diagnose("Box", &state(Phase::Connecting, 1, None), None), None);
+        let refused = state(Phase::Blocked, 1, Some(Failure::http(401, "x")));
+        let diagnosis = diagnose("Box", &refused, Some("1.2.3")).unwrap();
+        assert_eq!(diagnosis.headline, "T3 Code on Box did not accept this device");
+        assert_eq!(
+            diagnosis.hops,
+            vec![("This device".into(), HopResult::Ok), ("T3 Code on Box".into(), HopResult::Failed)]
+        );
+        assert_eq!(diagnosis.facts[0], ("Cause", "authentication".into()));
+        assert!(diagnosis.facts.contains(&("Host version", "1.2.3".into())));
+
+        let mut backoff = state(Phase::Backoff, 3, Some(Failure::environment_mismatch("a", "b")));
+        backoff.retry_at = Some(0);
+        let diagnosis = diagnose("Box", &backoff, None).unwrap();
+        assert_eq!(diagnosis.headline, "T3 Code on Box did not answer");
+        // No hop was named, so the device was never checked.
+        assert_eq!(diagnosis.hops[0].1, HopResult::Unchecked);
+        assert!(diagnosis.facts.contains(&("Next retry", "1970-01-01T00:00:00.000Z".into())));
+        assert!(diagnosis.facts.contains(&("Attempts", "3".into())));
+
+        let saved = SavedEnvironment {
+            environment_id: "e".into(),
+            label: "Box".into(),
+            http_base: "https://box:4000".into(),
+            enabled: true,
+            credential: Credential::Missing,
+        };
+        let missing = state(Phase::Blocked, 1, Some(Failure::credential_missing(&saved)));
+        let diagnosis = diagnose("Box", &missing, None).unwrap();
+        assert_eq!(diagnosis.headline, "This device could not prepare the connection");
+        assert!(
+            diagnosis
+                .facts
+                .contains(&("Error", "Connection credential bearer:e:https://box:4000 is unavailable.".into()))
+        );
+        let text = diagnosis_text("Box", &diagnosis);
+        assert!(text.starts_with("T3 Code connection to Box: This device could not prepare the connection\n\nThis device: FAILED\nT3 Code on Box: not checked\n\nCause: authentication"));
+
+        // A credential the keyring would not open says so, rather than that none is saved.
+        let locked = SavedEnvironment {
+            credential: Credential::Locked { stored: "00".into(), error: "Could not use the Keychain: denied".into() },
+            ..saved
+        };
+        let detail = Failure::credential_missing(&locked).detail;
+        assert!(detail.contains("is saved, but this device could not decrypt it (Could not use the Keychain: denied)"));
+    }
+
+    fn read(document: &Value, unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>) -> Catalog {
+        Catalog::from_document(document.clone(), unprotect).unwrap()
+    }
+
+    /// Stand-ins for the platform store: a reversible "encryption", and a keyring that refuses.
+    #[expect(clippy::unnecessary_wraps, reason = "the signature of `secure::protect`")]
+    fn seal(data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(data.iter().map(|byte| byte ^ 0x5a).collect())
+    }
+
+    fn denied(_: &[u8]) -> Result<Vec<u8>, String> {
+        Err("Could not use the Keychain: denied".into())
+    }
+
+    fn saved(id: &str, credential: Credential) -> SavedEnvironment {
+        SavedEnvironment {
+            environment_id: id.into(),
+            label: id.into(),
+            http_base: format!("https://{id}"),
+            enabled: true,
+            credential,
+        }
+    }
+
+    #[test]
+    fn credentials_the_keyring_cannot_open_survive_saves_of_other_changes() {
+        let catalog = Catalog {
+            local_environment_enabled: true,
+            environments: vec![saved("a", Credential::Token("token-a".into())), saved("b", Credential::Missing)],
+            ..Catalog::default()
+        };
+        let document = catalog.document(seal).unwrap();
+        assert!(!document.to_string().contains("token-a"));
+        assert_eq!(read(&document, seal).environments, catalog.environments);
+        let stored = document["environments"][0]["encryptedToken"].clone();
+
+        // This run's keyring refuses: the token is locked, not gone.
+        let mut locked = read(&document, denied);
+        let error = "Could not use the Keychain: denied".to_owned();
+        let expected = Credential::Locked { stored: stored.as_str().unwrap().into(), error };
+        assert_eq!(locked.environments[0].credential, expected);
+        assert_eq!(locked.environments[1].credential, Credential::Missing);
+        assert!(locked.environments[0].endpoint().is_none());
+
+        // Rename it, switch it off and pair another environment, then save.
+        locked.environments[0].label = "Renamed".into();
+        locked.environments[0].enabled = false;
+        locked.upsert(saved("c", Credential::Token("token-c".into())));
+        let saved_again = locked.document(seal).unwrap();
+        assert_eq!(saved_again["environments"][0]["encryptedToken"], stored);
+        assert_eq!(saved_again["environments"][1]["encryptedToken"], "");
+
+        // A later run whose keyring opens reads every token back.
+        let reopened = read(&saved_again, seal);
+        let tokens: Vec<_> = reopened.environments.iter().map(|e| e.credential.clone()).collect();
+        assert_eq!(
+            tokens,
+            [Credential::Token("token-a".into()), Credential::Missing, Credential::Token("token-c".into())]
+        );
+        assert_eq!(reopened.environments[0].label, "Renamed");
+    }
+
+    #[test]
+    fn unreadable_stored_credentials_are_kept_as_stored() {
+        for stored in ["zz", "0", "00ff"] {
+            let document = json!({ "environments": [{
+                "environmentId": "a", "label": "A", "httpBaseUrl": "https://a", "encryptedToken": stored,
+            }] });
+            let catalog = read(&document, seal);
+            assert!(
+                matches!(&catalog.environments[0].credential, Credential::Locked { stored: kept, .. } if kept == stored)
+            );
+            assert_eq!(catalog.document(seal).unwrap()["environments"][0]["encryptedToken"], stored);
+        }
+        assert_eq!(read(&json!({}), seal), Catalog::default());
+    }
+
+    #[test]
+    fn entries_and_fields_this_build_cannot_read_survive_a_save() {
+        let document = json!({
+            "version": 1,
+            "futureSetting": { "x": 1 },
+            "environments": [
+                { "environmentId": "a", "label": "A", "httpBaseUrl": "https://a", "routes": ["r"] },
+                { "environmentId": "b", "httpBaseUrl": "https://b", "kind": "ssh" },
+                { "environmentId": "c", "label": 7 },
+                "not an entry",
+            ],
+        });
+        let mut catalog = read(&document, seal);
+        assert_eq!(catalog.environments, [SavedEnvironment { label: "A".into(), ..saved("a", Credential::Missing) }]);
+
+        catalog.get_mut("a").unwrap().label = "Renamed".into();
+        let written = catalog.document(seal).unwrap();
+        assert_eq!(written["futureSetting"], json!({ "x": 1 }));
+        let entries = written["environments"].as_array().unwrap();
+        assert_eq!(entries[0]["label"], "Renamed");
+        assert_eq!(entries[0]["routes"], json!(["r"]));
+        assert_eq!(entries[1..], document["environments"].as_array().unwrap()[1..]);
+
+        // Pairing "c" again replaces its unreadable entry; removing "a" drops it.
+        catalog.upsert(saved("c", Credential::Missing));
+        catalog.environments.retain(|environment| environment.environment_id != "a");
+        let written = catalog.document(seal).unwrap();
+        let ids: Vec<_> =
+            written["environments"].as_array().unwrap().iter().map(|e| e["environmentId"].clone()).collect();
+        assert_eq!(ids, [json!("c"), json!("b"), Value::Null]);
+    }
+
+    #[test]
+    fn a_catalog_file_that_cannot_be_used_is_never_saved_over() {
+        let dir = std::env::temp_dir().join(format!("t3-gpui-catalog-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("environments.json");
+
+        let opened = open_at(&path, seal, 0);
+        assert!(!opened.read_only && opened.problem.is_none());
+        assert_eq!(opened.catalog, Catalog::default());
+
+        // Not a catalog: moved aside byte for byte, and the list starts empty.
+        for (ms, corrupt) in (1..).zip(["{\"environments\": [", "[1, 2]", "{\"environments\": 3}", ""]) {
+            std::fs::write(&path, corrupt).unwrap();
+            let opened = open_at(&path, seal, ms);
+            assert!(!opened.read_only);
+            assert!(opened.problem.unwrap().contains(&format!("environments.corrupt-{ms}.json")));
+            assert!(!path.exists());
+            assert_eq!(std::fs::read_to_string(dir.join(format!("environments.corrupt-{ms}.json"))).unwrap(), corrupt);
+        }
+
+        // Unreadable (here a directory): left in place, and saves are refused.
+        std::fs::create_dir(&path).unwrap();
+        let opened = open_at(&path, seal, 9);
+        assert!(opened.read_only && opened.problem.is_some());
+        assert!(path.is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn debug_output_never_shows_a_token() {
+        let environment = saved("a", Credential::Token("secret-token".into()));
+        let catalog = Catalog { environments: vec![environment.clone()], ..Catalog::default() };
+        for text in [format!("{environment:?}"), format!("{catalog:?}"), format!("{:#?}", environment.credential)] {
+            assert!(!text.contains("secret-token"), "{text}");
+        }
+        assert!(format!("{environment:?}").contains("credential: Token(<redacted>)"));
+        let locked = Credential::Locked { stored: "abcd".into(), error: "denied".into() };
+        assert_eq!(format!("{locked:?}"), r#"Locked { error: "denied", .. }"#);
+    }
+
+    /// DPAPI keeps its master keys in the user's profile (`%APPDATA%\Microsoft\Protect`). A
+    /// sandbox running as a user without a loaded profile fails every call with OS error 2.
+    /// A failure with the profile readable is a real failure, so the test still runs then.
+    #[cfg(windows)]
+    fn dpapi_unavailable() -> Option<String> {
+        let error = secure::protect(b"probe").err()?;
+        let keys = std::env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("Microsoft").join("Protect"));
+        let profile_readable = keys.is_some_and(|keys| std::fs::read_dir(keys).is_ok());
+        (!profile_readable).then_some(error)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_documents_round_trip_with_encrypted_tokens() {
+        if let Some(error) = dpapi_unavailable() {
+            eprintln!("skipped: DPAPI has no user profile here ({error})");
+            return;
+        }
+        let catalog = Catalog {
+            local_environment_enabled: false,
+            environments: vec![SavedEnvironment {
+                environment_id: "env-1".into(),
+                label: "Box".into(),
+                http_base: "https://box".into(),
+                enabled: false,
+                credential: Credential::Token("secret-token".into()),
+            }],
+            ..Catalog::default()
+        };
+        let document = catalog.document(secure::protect).unwrap();
+        assert!(!document.to_string().contains("secret-token"));
+        let reread = read(&document, secure::unprotect);
+        assert_eq!((reread.local_environment_enabled, reread.environments), (false, catalog.environments));
+        // A credential that was locked opens once the store works again.
+        let stored = document["environments"][0]["encryptedToken"].as_str().unwrap().to_owned();
+        let locked = Credential::Locked { stored, error: "locked".into() };
+        assert_eq!(locked.reopen(), Some(Credential::Token("secret-token".into())));
+        assert_eq!(Credential::Missing.reopen(), None);
+        // A credential DPAPI cannot open is kept as stored.
+        let mut tampered = document;
+        tampered["environments"][0]["encryptedToken"] = json!("00ff");
+        let reread = read(&tampered, secure::unprotect);
+        assert!(matches!(&reread.environments[0].credential, Credential::Locked { stored, .. } if stored == "00ff"));
+    }
+
+    #[test]
+    fn labels_must_not_be_empty() {
+        assert_eq!(validate_label("  Box "), Ok("Box".into()));
+        assert_eq!(validate_label("  "), Err("Environment label cannot be empty."));
+    }
+}
